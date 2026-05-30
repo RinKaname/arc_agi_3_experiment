@@ -1,5 +1,5 @@
 # =====================================================================
-# StochasticGoose – CNN-based action learning agent
+# AmadeusZero – CNN-based action learning agent
 # Source: https://github.com/DriesSmit/ARC3-solution
 # Authors: Dries Smit (Lead), Jack Cole (Adviser) — Tufa Labs
 #
@@ -137,7 +137,7 @@ class ActionModel(nn.Module):
         return combined_logits, hidden_state
 
 
-# --- Action Agent (StochasticGoose) ---
+# --- Action Agent (AmadeusZero) ---
 
 class MyAgent(Agent):
     """CNN-based action learning agent that predicts which actions cause frame changes."""
