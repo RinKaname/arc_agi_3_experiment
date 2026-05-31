@@ -192,7 +192,7 @@ class AmadeusZero(Agent):
         self.num_coordinates = self.grid_size * self.grid_size
         self.num_colours = 16
         self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
-        self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
+        self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
         self.hidden_state = None
 
         # Experience buffer (online RL experiences)
@@ -446,12 +446,16 @@ class AmadeusZero(Agent):
         # ------------------------------------------------------------------
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
-        bc_epochs = 30
-        chunk_size = 64  # Increased BPTT window to prevent reactive "spamming" policies. Still safe for VRAM.
+        bc_epochs = 35 # Aligned with user's snippet
+        chunk_size = 128  # Aligned with user's snippet. BPTT window to prevent reactive "spamming" policies.
         print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
         try:
             # Fresh optimizer — no stale momentum/variance from the RL checkpoint
-            bc_optimizer = optim.Adam(self.action_model.parameters(), lr=0.001)
+            bc_optimizer = optim.Adam(self.action_model.parameters(), lr=0.0003, weight_decay=1e-4) # Aligned with user's snippet
+
+            best_loss = float('inf')
+            patience = 5
+            epochs_without_improvement = 0
 
             for epoch in range(bc_epochs):
                 epoch_loss = 0.0
@@ -512,8 +516,19 @@ class AmadeusZero(Agent):
                     avg = epoch_loss / max(total_chunks, 1)
                     print(f"  BC epoch {epoch + 1}/{bc_epochs}  avg_loss={avg:.4f}")
 
+                    # Early stopping logic
+                    if avg < best_loss:
+                        best_loss = avg
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += 1
+
+                    if epochs_without_improvement >= patience:
+                        print(f"Early stopping triggered at epoch {epoch + 1}: Loss hasn't improved for {patience} epochs.")
+                        break
+
             # Restore fresh RL optimizer — BC changed the weight landscape significantly
-            self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
+            self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
             print("Behavioral Cloning pre-training complete.")
             self.logger.info("Behavioral Cloning pre-training complete.")
         except Exception as e:
