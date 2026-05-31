@@ -204,7 +204,7 @@ class AmadeusZero(Agent):
 
         # Checkpoint configuration
         self.checkpoint_dir = "checkpoints"
-        self.checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.game_id}_model.pth")
+        self.checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.game_id}_model_v2.pth")
         self._load_checkpoint()
         self._pretrain_on_human_demonstration()
         atexit.register(self._save_checkpoint)
@@ -443,7 +443,23 @@ class AmadeusZero(Agent):
                     chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
                     bc_optimizer.zero_grad()
                     logits, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
-                    loss = F.cross_entropy(logits.squeeze(0), chunk_labels)
+                    logits_sq = logits.squeeze(0)  # [L, 4102]
+
+                    # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
+                    action_type_labels = torch.where(chunk_labels < 5, chunk_labels, torch.tensor(5, device=chunk_labels.device))
+
+                    # 1. Action Type Loss
+                    loss_action = F.cross_entropy(logits_sq[:, :6], action_type_labels)
+
+                    # 2. Coordinate Loss (only applied if action 5 was the true label)
+                    coord_mask = (chunk_labels >= 5)
+                    loss_coord = torch.tensor(0.0, device=logits.device)
+                    if coord_mask.any():
+                        coord_labels = chunk_labels[coord_mask] - 5
+                        coord_logits = logits_sq[coord_mask, 6:]
+                        loss_coord = F.cross_entropy(coord_logits, coord_labels)
+
+                    loss = loss_action + loss_coord
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
                     bc_optimizer.step()
