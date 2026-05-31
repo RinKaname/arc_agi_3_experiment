@@ -367,6 +367,7 @@ class AmadeusZero(Agent):
                         'state': prev_state_np,
                         'action_idx': prev_action_idx,
                         'reward': 1.0,  # placeholder; will be set below
+                        'score': data.get('score', data.get('levels_completed', 0))
                     })
 
                 action_input = data.get("action_input")
@@ -385,9 +386,18 @@ class AmadeusZero(Agent):
 
             # Apply discounted rewards — human demo actions are positive BCE targets.
             # Use 1.0 as base (clean BCE target) with mild discounting for earlier steps.
+            # Reset discount per level to maintain strong signals for early levels.
             gamma = 0.997
             running = 1.0
+            last_score = transitions[-1]['score'] if transitions else 0
+
             for i in reversed(range(len(transitions))):
+                current_score = transitions[i]['score']
+                if current_score != last_score:
+                    # New level boundary moving backwards, reset running reward
+                    running = 1.0
+                    last_score = current_score
+
                 transitions[i]['reward'] = running
                 running *= gamma
 
