@@ -428,7 +428,7 @@ class AmadeusZero(Agent):
         #    boundaries so the LSTM sees full trajectory context, not isolated windows.
         #    Fresh optimizer avoids stale Adam moments from the loaded RL checkpoint.
         # ------------------------------------------------------------------
-        bc_epochs = 150
+        bc_epochs = 30
         chunk_size = 16  # BPTT window — keeps VRAM flat regardless of demo length
         print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT), "
               f"{len(transitions)} transitions...")
