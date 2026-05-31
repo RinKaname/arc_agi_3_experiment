@@ -80,9 +80,16 @@ class ActionModel(nn.Module):
         self.action_pool = nn.MaxPool2d(4, 4)
         self.lstm = nn.LSTM(input_size=32 * 16 * 16, hidden_size=512, batch_first=True)
 
-        # Action head
+        # Action head (Actor)
         self.action_head = nn.Linear(512, self.num_action_types)
         self.lstm_to_spatial = nn.Linear(512, 32)
+
+        # Value head (Critic) - Predicts probability to reach the goal (expected reward)
+        self.value_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
 
         # Coordinate head (64x64 action space)
         # Using a sequence of 3x3 convs to create a receptive field for the heatmap
@@ -114,7 +121,8 @@ class ActionModel(nn.Module):
         conv_features = F.relu(self.conv4(x))
 
         # Flatten for LSTM. We need to pool first to match input_size
-        pooled_features = self.action_pool(conv_features)
+        proj_features = F.relu(self.proj(conv_features))
+        pooled_features = self.action_pool(proj_features)
         flattened = pooled_features.view(batch_size, seq_len, -1)
 
         lstm_out, hidden_state = self.lstm(flattened, hidden_state)
@@ -136,10 +144,14 @@ class ActionModel(nn.Module):
         coord_logits = coord_logits.view(batch_size * seq_len, -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
-        # Reshape to [batch, seq_len, 5+4096]
+        # Reshape to [batch, seq_len, 6+4096]
         combined_logits = combined_logits.view(batch_size, seq_len, -1)
 
-        return combined_logits, hidden_state
+        # Value Head
+        state_values = self.value_head(lstm_out.contiguous().view(batch_size * seq_len, -1))
+        state_values = state_values.view(batch_size, seq_len)
+
+        return combined_logits, state_values, hidden_state
 
 
 # --- Action Agent (AmadeusZero) ---
@@ -442,7 +454,7 @@ class AmadeusZero(Agent):
                     chunk_states = all_states_cpu[start:end].to(self.device).unsqueeze(0)  # [1, L, C, H, W]
                     chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
                     bc_optimizer.zero_grad()
-                    logits, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
+                    logits, state_values, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
                     logits_sq = logits.squeeze(0)  # [L, 4102]
 
                     # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
@@ -612,7 +624,8 @@ class AmadeusZero(Agent):
         self.optimizer.zero_grad()
 
         # combined_logits shape: [batch=1, seq_len, output_dim]
-        combined_logits, _ = self.action_model(states)
+        # state_values shape: [batch=1, seq_len]
+        combined_logits, state_values, _ = self.action_model(states)
 
         # --- RL loss: Policy Gradient with categorical cross entropy ---
 
@@ -637,8 +650,12 @@ class AmadeusZero(Agent):
                 reduction='none'
             )
 
-        # Apply rewards to the losses
-        step_losses = (loss_action + loss_coord) * rewards
+        # Compute advantage for the policy update (Actor-Critic style)
+        # Detach state_values so gradients don't flow back through the critic from the policy loss
+        advantage = rewards - state_values.detach()
+
+        # Apply advantage to the losses
+        step_losses = (loss_action + loss_coord) * advantage
         main_loss = step_losses.mean()
 
         # --- Entropy regularisation (encourages exploration) ---
@@ -648,7 +665,11 @@ class AmadeusZero(Agent):
         coord_probs = F.softmax(combined_logits[:, :, 6:], dim=-1)
         coord_entropy = -(coord_probs * torch.log(coord_probs + 1e-8)).sum(-1).mean()
 
-        total_loss = main_loss - 0.001 * action_entropy - 0.0001 * coord_entropy
+        # --- Value Loss (Critic) ---
+        # MSE between predicted expected return (state_values) and actual empirical return (rewards)
+        value_loss = F.mse_loss(state_values, rewards)
+
+        total_loss = main_loss + 0.5 * value_loss - 0.001 * action_entropy - 0.0001 * coord_entropy
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
         self.optimizer.step()
@@ -767,7 +788,7 @@ class AmadeusZero(Agent):
             with torch.no_grad():
                 # Add batch and seq_len dimensions: [1, 1, C, H, W]
                 current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
-                combined_logits, self.hidden_state = self.action_model(current_frame_seq, self.hidden_state)
+                combined_logits, state_values, self.hidden_state = self.action_model(current_frame_seq, self.hidden_state)
                 # Remove batch and seq_len dims for sampling: [1, 1, output_dim] -> [output_dim]
                 combined_logits = combined_logits.squeeze(0).squeeze(0)
                 action_idx, coords, coord_idx, all_probs = self._sample_from_combined_output(

@@ -18,5 +18,12 @@ Currently, the `batch_size = 64` and `train_frequency = 5` (trains once every 5 
 The biggest bottleneck in offline RL is often waiting for the game simulator to step forward on the CPU.
 **Suggestion**: If the ARC environment allows it, run multiple environment instances in parallel (e.g., 4-8 parallel games). The agent then predicts actions in a batched forward pass for all 8 environments simultaneously, which completely fills the GPU pipeline.
 
+## 5. Implement an Actor-Critic Architecture (Value Head)
+Currently, the V2 agent is a pure policy-gradient/behavioral-cloning model (an "Actor"). It predicts the next best move based on the human demonstrations but lacks a fundamental understanding of whether it is actually winning or losing.
+**Task**: Introduce a **Value Head (Critic)** to `amadeuszero_v2.py`.
+* **Concept:** The network should learn to map the current state to a scalar value representing the "probability to reach the goal objective" (expected discounted returns).
+* **Implementation:** Add a dense layer (`self.value_head`) branching off the LSTM hidden state. Update the training loop to calculate the Value Loss (MSE between the predicted value and the actual episode reward) alongside the Policy loss.
+* **Why?** This is the crucial first step toward the ultimate MuZero architecture, allowing the model to evaluate the "goodness" of a grid state rather than just blindly predicting clicks.
+
 ---
 *Note: These changes are marked as TBA (To Be Announced / To Be Added) to prevent burning up "CUDA-chan" prematurely.*
