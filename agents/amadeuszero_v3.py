@@ -295,12 +295,26 @@ class MCTS:
         root_policy[:5] = action_probs[:5]
         root_policy[5:] = action_probs[5] * coord_probs
 
+        # Determine candidate actions to expand at root (before adding noise so we don't pick random junk)
+        candidate_actions = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=8)
+
+        # Add Dirichlet noise to the root policy to ensure exploration (MuZero/AlphaZero standard)
+        dirichlet_alpha = 0.3
+        dirichlet_frac = 0.25
+        # Only add noise to the candidate actions to keep it bounded
+        noise = np.random.dirichlet([dirichlet_alpha] * len(candidate_actions))
+        for i, a in enumerate(candidate_actions):
+            root_policy[a] = root_policy[a] * (1 - dirichlet_frac) + noise[i] * dirichlet_frac
+
+        # Re-normalize the candidate priors just in case
+        prior_sum = sum(root_policy[a] for a in candidate_actions)
+        if prior_sum > 0:
+            for a in candidate_actions:
+                root_policy[a] /= prior_sum
+
         # Initialize root node
         root = MCTSNode(prior=1.0)
         root.hidden_state = hidden_state
-        
-        # Determine candidate actions to expand at root
-        candidate_actions = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=8)
         
         # Expand root node: run dynamics to get hidden states and rewards for children
         with torch.no_grad():
@@ -392,21 +406,34 @@ class MCTS:
         return selected_action, visit_probs
 
     def _sample_candidate_actions(self, action_probs: np.ndarray, coord_probs: np.ndarray, num_candidates: int = 8) -> list[int]:
-        """Sample a small subset of candidate actions to keep branching factor bounded."""
+        """Sample a small subset of candidate actions to keep branching factor bounded.
+        Ensures coordinate actions (ACTION6) are always considered if they have non-zero probability.
+        """
         candidates = []
+        # Add top global actions
         for a in range(5):
             if action_probs[a] > 0.01:
                 candidates.append(a)
         
-        if action_probs[5] > 0.01:
-            num_coord_cand = min(num_candidates - len(candidates), 5)
+        # Always try to sample coordinate actions if ACTION6 has any meaningful probability
+        # Lowered the threshold slightly to ensure coordinates aren't ignored early in training
+        if action_probs[5] > 0.005:
+            # Ensure we sample at least 1 coordinate action, up to a max of 5
+            num_coord_cand = max(1, min(num_candidates - len(candidates), 5))
+
+            # Make sure we don't try to sample more than the available non-zero coords
+            nonzero_coords = np.count_nonzero(coord_probs > 0)
+            num_coord_cand = min(num_coord_cand, nonzero_coords)
+
             if num_coord_cand > 0:
                 sampled_coords = np.random.choice(len(coord_probs), size=num_coord_cand, replace=False, p=coord_probs)
                 for c in sampled_coords:
                     candidates.append(5 + c)
                     
+        # Fallback if extremely uncertain
         if not candidates:
             candidates = list(range(5))
+
         return candidates
 
     def _select_child(self, node: MCTSNode) -> tuple[int, MCTSNode]:
@@ -737,8 +764,8 @@ class AmadeusZero(Agent):
         # ------------------------------------------------------------------
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
-        bc_epochs = 10 # Aligned with user's snippet
-        chunk_size = 128  # Aligned with user's snippet. BPTT window to prevent reactive "spamming" policies.
+        bc_epochs = 35 # Increased to 35 to prevent policy collapse (per memory)
+        chunk_size = 32  # Reduced to 32 to prevent overfitting and VRAM OOM on 6GB GPU
         print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
         try:
             # Fresh optimizer — no stale momentum/variance from the RL checkpoint
@@ -975,67 +1002,87 @@ class AmadeusZero(Agent):
         hidden_state, batch_size, _ = self.action_model.representation(states[:, 0:1])
 
         L = states.size(1)
-        for t in range(L):
-            # 1. Prediction step: policy logits and state value
-            combined_logits, state_values = self.action_model.prediction(hidden_state, batch_size=1, seq_len=1)
-            combined_logits = combined_logits.squeeze(0)  # [1, 4102]
-            state_values = state_values.squeeze(0)        # [1]
+        # MuZero standard unroll length to prevent compounding prediction errors and VRAM OOM
+        unroll_steps = min(L, 5)
 
-            # Policy Loss for step t
-            action_type_target = torch.where(action_indices[:, t] < 5, action_indices[:, t], torch.tensor(5, device=self.device))
-            loss_action = F.cross_entropy(combined_logits[:, :6], action_type_target)
+        # Truncated BPTT: Instead of unrolling the whole sequence at once, we train by taking random
+        # chunks of length 'unroll_steps' from the sequence. This keeps VRAM flat while ensuring
+        # the model still sees terminal rewards from anywhere in the episode.
+        num_chunks = max(1, L // unroll_steps)
 
-            coord_mask = (action_indices[:, t] >= 5)
-            loss_coord = torch.tensor(0.0, device=self.device)
-            if coord_mask.any():
-                coord_target = action_indices[:, t][coord_mask] - 5
-                loss_coord = F.cross_entropy(combined_logits[:, 6:][coord_mask], coord_target)
+        for _ in range(num_chunks):
+            # Pick a random starting point for the unroll chunk
+            start_t = random.randint(0, max(0, L - unroll_steps))
+            end_t = min(start_t + unroll_steps, L)
+            chunk_length = end_t - start_t
 
-            # Compute advantage and Policy Gradient loss
-            advantage = rewards[:, t] - state_values.detach()
-            policy_loss = (loss_action + loss_coord) * advantage.mean()
+            # Re-compute initial hidden state for this specific chunk
+            hidden_state, batch_size, _ = self.action_model.representation(states[:, start_t:start_t+1])
+            chunk_loss = 0.0
 
-            # Value Loss
-            value_loss = F.mse_loss(state_values, rewards[:, t])
+            for t in range(start_t, end_t):
+                # 1. Prediction step: policy logits and state value
+                combined_logits, state_values = self.action_model.prediction(hidden_state, batch_size=1, seq_len=1)
+                combined_logits = combined_logits.squeeze(0)  # [1, 4102]
+                state_values = state_values.squeeze(0)        # [1]
 
-            # Entropy regularization
-            action_probs = F.softmax(combined_logits[:, :6], dim=-1)
-            action_entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(-1).mean()
-            coord_probs = F.softmax(combined_logits[:, 6:], dim=-1)
-            coord_entropy = -(coord_probs * torch.log(coord_probs + 1e-8)).sum(-1).mean()
+                # Policy Loss for step t
+                action_type_target = torch.where(action_indices[:, t] < 5, action_indices[:, t], torch.tensor(5, device=self.device))
+                loss_action = F.cross_entropy(combined_logits[:, :6], action_type_target)
 
-            total_loss += policy_loss + 0.5 * value_loss - 0.05 * action_entropy - 0.005 * coord_entropy
+                coord_mask = (action_indices[:, t] >= 5)
+                loss_coord = torch.tensor(0.0, device=self.device)
+                if coord_mask.any():
+                    coord_target = action_indices[:, t][coord_mask] - 5
+                    loss_coord = F.cross_entropy(combined_logits[:, 6:][coord_mask], coord_target)
 
-            # Dynamics and Consistency Step (only if not at final step)
-            if t < L - 1:
-                # Target hidden state from representation of the actual next frame
-                with torch.no_grad():
-                    target_hidden, _, _ = self.action_model.representation(states[:, t+1:t+2])
+                # Compute advantage and Policy Gradient loss
+                advantage = rewards[:, t] - state_values.detach()
+                policy_loss = (loss_action + loss_coord) * advantage.mean()
 
-                # Convert action taken to spatial planes
-                action_planes = encode_action_to_spatial_planes(
-                    action_indices[:, t], grid_size=self.action_model.grid_size, device=self.device
-                )
+                # Value Loss
+                value_loss = F.mse_loss(state_values, rewards[:, t])
 
-                # Dynamics step: predict next hidden state and immediate reward
-                next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_planes)
+                # Entropy regularization
+                action_probs = F.softmax(combined_logits[:, :6], dim=-1)
+                action_entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(-1).mean()
+                coord_probs = F.softmax(combined_logits[:, 6:], dim=-1)
+                coord_entropy = -(coord_probs * torch.log(coord_probs + 1e-8)).sum(-1).mean()
 
-                # Consistency Loss (match predicted hidden state with target representation)
-                consistency_loss = F.mse_loss(next_hidden, target_hidden.detach())
+                chunk_loss += policy_loss + 0.5 * value_loss - 0.05 * action_entropy - 0.005 * coord_entropy
 
-                # Reward Loss
-                reward_loss = F.mse_loss(pred_reward, step_rewards[:, t])
+                # Dynamics and Consistency Step (only if not at final step)
+                if t < end_t - 1:
+                    # Target hidden state from representation of the actual next frame
+                    with torch.no_grad():
+                        target_hidden, _, _ = self.action_model.representation(states[:, t+1:t+2])
 
-                total_loss += 0.5 * consistency_loss + 1.0 * reward_loss
+                    # Convert action taken to spatial planes
+                    action_planes = encode_action_to_spatial_planes(
+                        action_indices[:, t], grid_size=self.action_model.grid_size, device=self.device
+                    )
 
-                # Recurrent unroll
-                hidden_state = next_hidden
+                    # Dynamics step: predict next hidden state and immediate reward
+                    next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_planes)
 
-        # Normalize total loss by sequence length
-        total_loss = total_loss / L
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+                    # Consistency Loss (match predicted hidden state with target representation)
+                    consistency_loss = F.mse_loss(next_hidden, target_hidden.detach())
+
+                    # Reward Loss
+                    reward_loss = F.mse_loss(pred_reward, step_rewards[:, t])
+
+                    chunk_loss += 0.5 * consistency_loss + 1.0 * reward_loss
+
+                    # Recurrent unroll
+                    hidden_state = next_hidden
+
+            # Normalize chunk loss by chunk length
+            if chunk_length > 0:
+                chunk_loss = chunk_loss / chunk_length
+                chunk_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad() # Prepare for next chunk
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
