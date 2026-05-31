@@ -59,7 +59,84 @@ def setup_logging_for_experiment(log_file_path):
     root_logger.addHandler(file_handler)
 
 
-# --- ActionModel CNN ---
+# --- ActionModel ResNet ---
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = F.relu(out)
+        return out
+
+class DynamicsNetwork(nn.Module):
+    """The Imagination Engine: Predicts the next hidden state and immediate reward given a state and action."""
+    def __init__(self, hidden_channels=128, num_action_planes=7):
+        super().__init__()
+        # 128 (hidden state) + 7 (action planes) = 135
+        self.conv_in = nn.Conv2d(hidden_channels + num_action_planes, hidden_channels, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(hidden_channels)
+
+        self.res_blocks = nn.Sequential(
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels)
+        )
+
+        # Reward head
+        self.pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        self.reward_head = nn.Sequential(
+            nn.Linear(hidden_channels * 16 * 16, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1) # Predicts scalar reward
+        )
+
+    def forward(self, hidden_state, action_planes):
+        # Concatenate spatial hidden state and action planes
+        x = torch.cat([hidden_state, action_planes], dim=1)
+
+        # Process through ResNet to get next hidden state
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        next_hidden_state = self.res_blocks(x)
+
+        # Predict expected immediate reward
+        pooled = self.pool(next_hidden_state)
+        flattened = pooled.view(pooled.size(0), -1)
+        reward = self.reward_head(flattened).squeeze(-1)
+
+        return next_hidden_state, reward
+
+def encode_action_to_spatial_planes(action_idx, grid_size=64, device='cpu'):
+    """
+    Converts a flat action index (0 to 5 for buttons, 5 + coord for clicks)
+    into a 7-channel spatial representation [batch, 7, H, W] for the Dynamics network.
+    """
+    batch_size = action_idx.shape[0]
+    # Initialize blank canvas: 7 channels of 64x64
+    planes = torch.zeros(batch_size, 7, grid_size, grid_size, device=device)
+
+    for i in range(batch_size):
+        a = action_idx[i].item()
+        if a < 5:
+            # Action 1-5 (Global actions like MOVE UP). Fill the whole grid for that channel.
+            planes[i, a, :, :] = 1.0
+        else:
+            # Action 6 (Coordinate click).
+            coord = a - 5
+            y = coord // grid_size
+            x = coord % grid_size
+            # Only put a '1' exactly at the clicked coordinate on the 7th plane (index 6)
+            planes[i, 6, y, x] = 1.0
+
+    return planes
 
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
@@ -69,36 +146,36 @@ class ActionModel(nn.Module):
         self.grid_size = grid_size
         self.num_action_types = 6  # ACTION1-ACTION5, plus ACTION6
 
-        # Shared convolutional backbone (Added 2 channels for X/Y meshgrid)
-        self.conv1 = nn.Conv2d(input_channels + 2, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        # 1. Representation Network (Initial Observation -> Hidden State)
+        self.rep_conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
+        self.rep_bn_in = nn.BatchNorm2d(64)
+        self.rep_res_blocks = nn.Sequential(
+            ResidualBlock(64),
+            ResidualBlock(64),
+            ResidualBlock(64),
+            ResidualBlock(64)
+        )
+        self.rep_conv_out = nn.Conv2d(64, 128, kernel_size=3, padding=1)
 
-        # LSTM Working Memory
-        self.proj = nn.Conv2d(256, 32, kernel_size=1)
-        self.action_pool = nn.MaxPool2d(4, 4)
-        self.lstm = nn.LSTM(input_size=32 * 16 * 16, hidden_size=512, batch_first=True)
+        # 2. Dynamics Network (Hidden State + Action -> Next Hidden State + Reward)
+        self.dynamics_network = DynamicsNetwork(hidden_channels=128, num_action_planes=7)
 
-        # Action head (Actor)
+        # 3. Prediction Network (Hidden State -> Policy + Value)
+        self.pred_pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        self.pred_fc_proj = nn.Linear(128 * 16 * 16, 512)
+        self.dropout = nn.Dropout(0.2)
+
         self.action_head = nn.Linear(512, self.num_action_types)
-        self.lstm_to_spatial = nn.Linear(512, 32)
 
-        # Value head (Critic) - Predicts probability to reach the goal (expected reward)
         self.value_head = nn.Sequential(
             nn.Linear(512, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
 
-        # Coordinate head (64x64 action space)
-        # Using a sequence of 3x3 convs to create a receptive field for the heatmap
-        self.coord_conv1 = nn.Conv2d(256 + 32, 128, kernel_size=3, padding=1)
-        self.coord_conv2 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
-        self.coord_conv3 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
-        self.coord_conv4 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
-
-        self.dropout = nn.Dropout(0.2)
+        self.coord_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
+        self.coord_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
+        self.coord_conv3 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
 
         # Create the spatial meshgrid priors
         y_coords = torch.linspace(-1, 1, grid_size).view(-1, 1).repeat(1, grid_size)
@@ -106,8 +183,8 @@ class ActionModel(nn.Module):
         # Combine into [2, H, W]
         self.register_buffer('meshgrid', torch.stack([y_coords, x_coords], dim=0))
 
-    def forward(self, x, hidden_state=None):
-        # x is expected to be shape [batch, seq_len, channels, height, width]
+    def representation(self, x):
+        """Initial inference step mapping observation to hidden state."""
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
 
@@ -115,43 +192,41 @@ class ActionModel(nn.Module):
         mesh = self.meshgrid.unsqueeze(0).repeat(batch_size * seq_len, 1, 1, 1)
         x = torch.cat([x, mesh], dim=1)
 
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        conv_features = F.relu(self.conv4(x))
+        x = F.relu(self.rep_bn_in(self.rep_conv_in(x)))
+        res_features = self.rep_res_blocks(x)
+        hidden_state = F.relu(self.rep_conv_out(res_features))
+        return hidden_state, batch_size, seq_len
 
-        # Flatten for LSTM. We need to pool first to match input_size
-        proj_features = F.relu(self.proj(conv_features))
-        pooled_features = self.action_pool(proj_features)
-        flattened = pooled_features.view(batch_size, seq_len, -1)
+    def prediction(self, hidden_state, batch_size, seq_len):
+        """Maps hidden state to policy (action probabilities) and value."""
+        pooled = self.pred_pool(hidden_state)
+        flattened = pooled.view(batch_size * seq_len, -1)
+        common_features = F.relu(self.pred_fc_proj(flattened))
+        common_features = self.dropout(common_features)
 
-        lstm_out, hidden_state = self.lstm(flattened, hidden_state)
+        action_logits = self.action_head(common_features)
 
-        # Action head (using LSTM output)
-        action_features = self.dropout(lstm_out.contiguous().view(batch_size * seq_len, -1))
-        action_logits = self.action_head(action_features)
+        state_values = self.value_head(common_features)
+        state_values = state_values.view(batch_size, seq_len)
 
-        # Coordinate head
-        # Project LSTM features back into spatial dimensions [batch * seq_len, 32, h, w]
-        mem_features = F.relu(self.lstm_to_spatial(lstm_out.contiguous().view(batch_size * seq_len, -1)))
-        mem_spatial = mem_features.view(batch_size * seq_len, 32, 1, 1).expand(-1, -1, h, w)
-        coord_input = torch.cat([conv_features, mem_spatial], dim=1)
-
-        coord_features = F.relu(self.coord_conv1(coord_input))
+        coord_features = F.relu(self.coord_conv1(hidden_state))
         coord_features = F.relu(self.coord_conv2(coord_features))
-        coord_features = F.relu(self.coord_conv3(coord_features))
-        coord_logits = self.coord_conv4(coord_features)
+        coord_logits = self.coord_conv3(coord_features)
         coord_logits = coord_logits.view(batch_size * seq_len, -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
-        # Reshape to [batch, seq_len, 6+4096]
         combined_logits = combined_logits.view(batch_size, seq_len, -1)
 
-        # Value Head
-        state_values = self.value_head(lstm_out.contiguous().view(batch_size * seq_len, -1))
-        state_values = state_values.view(batch_size, seq_len)
+        return combined_logits, state_values
 
-        return combined_logits, state_values, hidden_state
+    def forward(self, x, hidden_state=None):
+        """
+        Standard forward pass for Behavioral Cloning and Actor-Critic RL.
+        (MCTS will use .representation, .dynamics_network, and .prediction directly).
+        """
+        hidden_state, batch_size, seq_len = self.representation(x)
+        combined_logits, state_values = self.prediction(hidden_state, batch_size, seq_len)
+        return combined_logits, state_values, None
 
 
 # --- Action Agent (AmadeusZero) ---
@@ -193,6 +268,8 @@ class AmadeusZero(Agent):
         self.num_colours = 16
         self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
         self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
+
+        # LSTM hidden state is removed in Phase 1 ResNet transition
         self.hidden_state = None
 
         # Experience buffer (online RL experiences)
@@ -477,7 +554,6 @@ class AmadeusZero(Agent):
                         [t['action_idx'] for t in transitions], dtype=torch.long
                     )  # [N]
 
-                    hidden = None  # carry hidden state across chunks (detached each step); reset for each game trajectory
                     starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
 
                     for start in starts:
@@ -486,7 +562,7 @@ class AmadeusZero(Agent):
                         chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
 
                         bc_optimizer.zero_grad()
-                        logits, state_values, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
+                        logits, state_values, _ = self.action_model(chunk_states)  # [1, L, output_dim]
                         logits_sq = logits.squeeze(0)  # [L, 4102]
 
                         # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
@@ -509,8 +585,6 @@ class AmadeusZero(Agent):
                         bc_optimizer.step()
                         epoch_loss += loss.item()
                         total_chunks += 1
-                        # Detach hidden state — prevents gradient graph from growing unbounded
-                        hidden = tuple(h.detach() for h in hidden)
 
                 if (epoch + 1) % 1 == 0:
                     avg = epoch_loss / max(total_chunks, 1)
@@ -787,7 +861,6 @@ class AmadeusZero(Agent):
                 # Note: We purposely do NOT reset network and optimizer here anymore,
                 # allowing the agent to retain its learned weights across levels of the same game.
                 print("Keeping action model and optimizer weights for new level")
-                self.hidden_state = None
 
                 self.prev_frame = None
                 self.prev_action_idx = None
@@ -841,7 +914,7 @@ class AmadeusZero(Agent):
             with torch.no_grad():
                 # Add batch and seq_len dimensions: [1, 1, C, H, W]
                 current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
-                combined_logits, state_values, self.hidden_state = self.action_model(current_frame_seq, self.hidden_state)
+                combined_logits, state_values, _ = self.action_model(current_frame_seq)
                 # Remove batch and seq_len dims for sampling: [1, 1, output_dim] -> [output_dim]
                 combined_logits = combined_logits.squeeze(0).squeeze(0)
                 action_idx, coords, coord_idx, all_probs = self._sample_from_combined_output(
