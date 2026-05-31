@@ -315,7 +315,7 @@ class AmadeusZero(Agent):
             return 5 + coord_idx
 
     def _pretrain_on_human_demonstration(self) -> None:
-        """Find and pre-train the model on any matching human demonstration recording.
+        """Find and pre-train the model on matching human/player demonstration recordings.
 
         Uses two complementary techniques:
         1. Behavioral Cloning (BC): True cross-entropy loss on ground-truth action labels
@@ -326,161 +326,192 @@ class AmadeusZero(Agent):
         """
         import json
 
-        # Locate the human recording file
-        human_file = None
-        recordings_dir = "recordings"
-        if os.path.exists(recordings_dir):
-            for f in sorted(os.listdir(recordings_dir)):
-                # Primary: standard .human. naming convention
-                if f.startswith(self.game_id) and ".human." in f and f.endswith(".recording.jsonl"):
-                    human_file = os.path.join(recordings_dir, f)
-                    break
-        # Fallback: bare game-prefix json (e.g. ls20-777616c6-....json)
-        if not human_file and os.path.exists(recordings_dir):
-            game_prefix = self.game_id.split("-")[0]
-            for f in sorted(os.listdir(recordings_dir)):
-                if f.startswith(game_prefix) and f.endswith(".json") and "." not in f.split("-", 1)[1].split(".")[0]:
-                    human_file = os.path.join(recordings_dir, f)
-                    break
+        # 1. Locate all matching human/player recording files
+        human_files = []
+        recordings_dirs = ["recordings", os.path.join("recordings", "player")]
+        game_prefix = self.game_id.split("-")[0]
 
-        if not human_file:
-            self.logger.info("No human demonstration file found; skipping pre-training.")
-            print("No human demonstration file found; skipping pre-training.")
+        for r_dir in recordings_dirs:
+            if os.path.exists(r_dir):
+                for f in sorted(os.listdir(r_dir)):
+                    file_path = os.path.join(r_dir, f)
+                    if os.path.isdir(file_path):
+                        continue
+
+                    is_json_or_jsonl = f.endswith(".json") or f.endswith(".jsonl")
+                    if not is_json_or_jsonl:
+                        continue
+
+                    # Filter: Player playthroughs in records, standard .human. recordings,
+                    # or files without agent names (amadeuszero, myagent, myagent2, random)
+                    is_agent_recording = any(agent_name in f for agent_name in [".amadeuszero.", ".myagent.", ".myagent2.", ".random."])
+
+                    if f.startswith(self.game_id) or f.startswith(game_prefix):
+                        # Always include files in recordings/player or standard .human. recordings
+                        if "player" in r_dir or ".human." in f or not is_agent_recording:
+                            human_files.append(file_path)
+
+        human_files = sorted(list(set(human_files)))
+
+        if not human_files:
+            self.logger.info("No human demonstration files found; skipping pre-training.")
+            print("No human demonstration files found; skipping pre-training.")
             return
 
-        self.logger.info(f"Human demo found: {human_file}. Starting BC pre-training + experience injection...")
-        print(f"Human demo found: {human_file}")
+        self.logger.info(f"Found {len(human_files)} demo files. Parsing...")
+        print(f"Found {len(human_files)} human/player demos: {human_files}")
 
         # ------------------------------------------------------------------
-        # 1. Parse the recording into (state_tensor, action_idx) transitions
+        # 2. Parse all recordings into independent trajectories
         # ------------------------------------------------------------------
-        transitions: list[dict] = []  # {'state': np.array, 'action_idx': int, 'reward': float}
-        try:
-            with open(human_file, "r", encoding="utf-8") as fh:
-                lines = [json.loads(l) for l in fh if l.strip()]
+        trajectories: list[list[dict]] = []
 
-            prev_state_np = None
-            prev_action_idx = None
+        for human_file in human_files:
+            transitions: list[dict] = []
+            try:
+                with open(human_file, "r", encoding="utf-8") as fh:
+                    content = fh.read().strip()
+                    if content.startswith("["):
+                        lines = json.loads(content)
+                    else:
+                        lines = [json.loads(l) for l in content.splitlines() if l.strip()]
 
-            for line in lines:
-                data = line.get("data", {})
-                if not data:
+                prev_state_np = None
+                prev_action_idx = None
+
+                for line in lines:
+                    data = line.get("data", {})
+                    if not data:
+                        continue
+                    frame_layers = data.get("frame")
+                    if not frame_layers:
+                        continue
+
+                    frame_arr = np.array(frame_layers, dtype=np.int64)[-1]  # last channel
+                    tensor = torch.zeros(self.num_colours, self.grid_size, self.grid_size, dtype=torch.float32)
+                    tensor.scatter_(0, torch.from_numpy(frame_arr).unsqueeze(0), 1)
+                    state_np = tensor.numpy().astype(bool)
+
+                    if prev_state_np is not None and prev_action_idx is not None:
+                        transitions.append({
+                            'state': prev_state_np,
+                            'action_idx': prev_action_idx,
+                            'reward': 1.0,  # placeholder; will be set below
+                            'score': data.get('score', data.get('levels_completed', 0))
+                        })
+
+                    action_input = data.get("action_input")
+                    if action_input:
+                        prev_action_idx = self._action_input_to_index(
+                            action_input.get("id"), action_input.get("data", {})
+                        )
+                    else:
+                        prev_action_idx = None
+
+                    prev_state_np = state_np
+
+                if not transitions:
                     continue
-                frame_layers = data.get("frame")
-                if not frame_layers:
-                    continue
 
-                frame_arr = np.array(frame_layers, dtype=np.int64)[-1]  # last channel
-                tensor = torch.zeros(self.num_colours, self.grid_size, self.grid_size, dtype=torch.float32)
-                tensor.scatter_(0, torch.from_numpy(frame_arr).unsqueeze(0), 1)
-                state_np = tensor.numpy().astype(bool)
+                # Apply discounted rewards per trajectory
+                gamma = 0.997
+                running = 1.0
+                last_score = transitions[-1]['score'] if transitions else 0
 
-                if prev_state_np is not None and prev_action_idx is not None:
-                    transitions.append({
-                        'state': prev_state_np,
-                        'action_idx': prev_action_idx,
-                        'reward': 1.0,  # placeholder; will be set below
-                        'score': data.get('score', data.get('levels_completed', 0))
-                    })
+                for i in reversed(range(len(transitions))):
+                    current_score = transitions[i]['score']
+                    if current_score != last_score:
+                        # New level boundary moving backwards, reset running reward
+                        running = 1.0
+                        last_score = current_score
 
-                action_input = data.get("action_input")
-                if action_input:
-                    prev_action_idx = self._action_input_to_index(
-                        action_input.get("id"), action_input.get("data", {})
-                    )
-                else:
-                    prev_action_idx = None
+                    transitions[i]['reward'] = running
+                    running *= gamma
 
-                prev_state_np = state_np
+                trajectories.append(transitions)
+                print(f"Parsed {len(transitions)} transitions from {human_file}.")
 
-            if not transitions:
-                print("No valid transitions found in human demonstration.")
-                return
+            except Exception as e:
+                self.logger.error(f"Error parsing {human_file}: {e}")
+                print(f"Error parsing {human_file}: {e}")
+                traceback.print_exc()
 
-            # Apply discounted rewards — human demo actions are positive BCE targets.
-            # Use 1.0 as base (clean BCE target) with mild discounting for earlier steps.
-            # Reset discount per level to maintain strong signals for early levels.
-            gamma = 0.997
-            running = 1.0
-            last_score = transitions[-1]['score'] if transitions else 0
-
-            for i in reversed(range(len(transitions))):
-                current_score = transitions[i]['score']
-                if current_score != last_score:
-                    # New level boundary moving backwards, reset running reward
-                    running = 1.0
-                    last_score = current_score
-
-                transitions[i]['reward'] = running
-                running *= gamma
-
-            print(f"Parsed {len(transitions)} transitions from human demo.")
-
-        except Exception as e:
-            self.logger.error(f"Error parsing human demo: {e}")
-            print(f"Error parsing human demo: {e}")
-            traceback.print_exc()
+        total_transitions = sum(len(t) for t in trajectories)
+        if total_transitions == 0:
+            print("No valid transitions found in any human demonstration.")
             return
 
+        print(f"Total transitions parsed: {total_transitions} across {len(trajectories)} trajectories.")
+
         # ------------------------------------------------------------------
-        # 2. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
-        #    Chunks are processed IN ORDER with hidden state carried (detached) across
-        #    boundaries so the LSTM sees full trajectory context, not isolated windows.
-        #    Fresh optimizer avoids stale Adam moments from the loaded RL checkpoint.
+        # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
-        bc_epochs = 30
+        bc_epochs = 150
         chunk_size = 16  # BPTT window — keeps VRAM flat regardless of demo length
-        print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT), "
-              f"{len(transitions)} transitions...")
+        print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
         try:
-            # Build tensors on CPU; move chunk-by-chunk to keep VRAM usage bounded
-            all_states_cpu = torch.stack([
-                torch.from_numpy(t['state']).float() for t in transitions
-            ])  # [N, C, H, W]
-            all_labels_cpu = torch.tensor(
-                [t['action_idx'] for t in transitions], dtype=torch.long
-            )  # [N]
-
             # Fresh optimizer — no stale momentum/variance from the RL checkpoint
             bc_optimizer = optim.Adam(self.action_model.parameters(), lr=0.001)
 
-            n = len(transitions)
-            starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
             for epoch in range(bc_epochs):
                 epoch_loss = 0.0
-                hidden = None  # carry hidden state across chunks (detached each step)
-                for start in starts:
-                    end = min(start + chunk_size, n)
-                    chunk_states = all_states_cpu[start:end].to(self.device).unsqueeze(0)  # [1, L, C, H, W]
-                    chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
-                    bc_optimizer.zero_grad()
-                    logits, state_values, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
-                    logits_sq = logits.squeeze(0)  # [L, 4102]
+                total_chunks = 0
 
-                    # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
-                    action_type_labels = torch.where(chunk_labels < 5, chunk_labels, torch.tensor(5, device=chunk_labels.device))
+                # Shuffle trajectories to avoid ordering bias across epochs
+                random.shuffle(trajectories)
 
-                    # 1. Action Type Loss
-                    loss_action = F.cross_entropy(logits_sq[:, :6], action_type_labels)
+                for transitions in trajectories:
+                    n = len(transitions)
+                    if n < 1:
+                        continue
 
-                    # 2. Coordinate Loss (only applied if action 5 was the true label)
-                    coord_mask = (chunk_labels >= 5)
-                    loss_coord = torch.tensor(0.0, device=logits.device)
-                    if coord_mask.any():
-                        coord_labels = chunk_labels[coord_mask] - 5
-                        coord_logits = logits_sq[coord_mask, 6:]
-                        loss_coord = F.cross_entropy(coord_logits, coord_labels)
+                    # Build tensors on CPU; move chunk-by-chunk to keep VRAM usage bounded
+                    all_states_cpu = torch.stack([
+                        torch.from_numpy(t['state']).float() for t in transitions
+                    ])  # [N, C, H, W]
+                    all_labels_cpu = torch.tensor(
+                        [t['action_idx'] for t in transitions], dtype=torch.long
+                    )  # [N]
 
-                    loss = loss_action + loss_coord
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
-                    bc_optimizer.step()
-                    epoch_loss += loss.item()
-                    # Detach hidden state — prevents gradient graph from growing unbounded
-                    hidden = tuple(h.detach() for h in hidden)
-                if (epoch + 1) % 30 == 0:
-                    avg = epoch_loss / max(len(starts), 1)
+                    hidden = None  # carry hidden state across chunks (detached each step); reset for each game trajectory
+                    starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
+
+                    for start in starts:
+                        end = min(start + chunk_size, n)
+                        chunk_states = all_states_cpu[start:end].to(self.device).unsqueeze(0)  # [1, L, C, H, W]
+                        chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
+
+                        bc_optimizer.zero_grad()
+                        logits, state_values, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
+                        logits_sq = logits.squeeze(0)  # [L, 4102]
+
+                        # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
+                        action_type_labels = torch.where(chunk_labels < 5, chunk_labels, torch.tensor(5, device=chunk_labels.device))
+
+                        # 1. Action Type Loss
+                        loss_action = F.cross_entropy(logits_sq[:, :6], action_type_labels)
+
+                        # 2. Coordinate Loss (only applied if action 5 was the true label)
+                        coord_mask = (chunk_labels >= 5)
+                        loss_coord = torch.tensor(0.0, device=logits.device)
+                        if coord_mask.any():
+                            coord_labels = chunk_labels[coord_mask] - 5
+                            coord_logits = logits_sq[coord_mask, 6:]
+                            loss_coord = F.cross_entropy(coord_logits, coord_labels)
+
+                        loss = loss_action + loss_coord
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
+                        bc_optimizer.step()
+                        epoch_loss += loss.item()
+                        total_chunks += 1
+                        # Detach hidden state — prevents gradient graph from growing unbounded
+                        hidden = tuple(h.detach() for h in hidden)
+
+                if (epoch + 1) % 1 == 0:
+                    avg = epoch_loss / max(total_chunks, 1)
                     print(f"  BC epoch {epoch + 1}/{bc_epochs}  avg_loss={avg:.4f}")
+
             # Restore fresh RL optimizer — BC changed the weight landscape significantly
             self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001)
             print("Behavioral Cloning pre-training complete.")
@@ -491,10 +522,12 @@ class AmadeusZero(Agent):
             traceback.print_exc()
 
         # ------------------------------------------------------------------
-        # 3. Experience Injection — pin human demos into a permanent buffer
+        # 4. Experience Injection — pin human demos into a permanent buffer
         #    that is blended into every _train_action_model() call.
         # ------------------------------------------------------------------
-        self.human_demo_buffer = list(transitions)
+        self.human_demo_buffer = []
+        for transitions in trajectories:
+            self.human_demo_buffer.extend(transitions)
         print(f"Experience injection: {len(self.human_demo_buffer)} human transitions pinned to human_demo_buffer.")
         self.logger.info(f"Pinned {len(self.human_demo_buffer)} human transitions into human_demo_buffer.")
 
