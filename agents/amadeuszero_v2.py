@@ -446,7 +446,7 @@ class AmadeusZero(Agent):
         # ------------------------------------------------------------------
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
-        bc_epochs = 150
+        bc_epochs = 30
         chunk_size = 16  # BPTT window — keeps VRAM flat regardless of demo length
         print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
         try:
