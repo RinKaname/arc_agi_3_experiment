@@ -77,6 +77,67 @@ class ResidualBlock(nn.Module):
         out = F.relu(out)
         return out
 
+class DynamicsNetwork(nn.Module):
+    """The Imagination Engine: Predicts the next hidden state and immediate reward given a state and action."""
+    def __init__(self, hidden_channels=128, num_action_planes=7):
+        super().__init__()
+        # 128 (hidden state) + 7 (action planes) = 135
+        self.conv_in = nn.Conv2d(hidden_channels + num_action_planes, hidden_channels, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(hidden_channels)
+
+        self.res_blocks = nn.Sequential(
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels)
+        )
+
+        # Reward head
+        self.pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        self.reward_head = nn.Sequential(
+            nn.Linear(hidden_channels * 16 * 16, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1) # Predicts scalar reward
+        )
+
+    def forward(self, hidden_state, action_planes):
+        # Concatenate spatial hidden state and action planes
+        x = torch.cat([hidden_state, action_planes], dim=1)
+
+        # Process through ResNet to get next hidden state
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        next_hidden_state = self.res_blocks(x)
+
+        # Predict expected immediate reward
+        pooled = self.pool(next_hidden_state)
+        flattened = pooled.view(pooled.size(0), -1)
+        reward = self.reward_head(flattened).squeeze(-1)
+
+        return next_hidden_state, reward
+
+def encode_action_to_spatial_planes(action_idx, grid_size=64, device='cpu'):
+    """
+    Converts a flat action index (0 to 5 for buttons, 5 + coord for clicks)
+    into a 7-channel spatial representation [batch, 7, H, W] for the Dynamics network.
+    """
+    batch_size = action_idx.shape[0]
+    # Initialize blank canvas: 7 channels of 64x64
+    planes = torch.zeros(batch_size, 7, grid_size, grid_size, device=device)
+
+    for i in range(batch_size):
+        a = action_idx[i].item()
+        if a < 5:
+            # Action 1-5 (Global actions like MOVE UP). Fill the whole grid for that channel.
+            planes[i, a, :, :] = 1.0
+        else:
+            # Action 6 (Coordinate click).
+            coord = a - 5
+            y = coord // grid_size
+            x = coord % grid_size
+            # Only put a '1' exactly at the clicked coordinate on the 7th plane (index 6)
+            planes[i, 6, y, x] = 1.0
+
+    return planes
+
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
 
@@ -85,41 +146,36 @@ class ActionModel(nn.Module):
         self.grid_size = grid_size
         self.num_action_types = 6  # ACTION1-ACTION5, plus ACTION6
 
-        # ResNet Representation Network (Replaces shallow CNN + LSTM)
-        self.conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(64)
-
-        self.res_blocks = nn.Sequential(
+        # 1. Representation Network (Initial Observation -> Hidden State)
+        self.rep_conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
+        self.rep_bn_in = nn.BatchNorm2d(64)
+        self.rep_res_blocks = nn.Sequential(
             ResidualBlock(64),
             ResidualBlock(64),
             ResidualBlock(64),
             ResidualBlock(64)
         )
+        self.rep_conv_out = nn.Conv2d(64, 128, kernel_size=3, padding=1)
 
-        self.conv_out = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        # 2. Dynamics Network (Hidden State + Action -> Next Hidden State + Reward)
+        self.dynamics_network = DynamicsNetwork(hidden_channels=128, num_action_planes=7)
 
-        # We flatten the spatial dimensions (128 channels * 64 * 64) for the Actor/Critic heads.
-        # To keep parameter count reasonable, we use max pooling first.
-        self.pool = nn.MaxPool2d(4, 4) # output is 16x16
-        self.fc_proj = nn.Linear(128 * 16 * 16, 512)
+        # 3. Prediction Network (Hidden State -> Policy + Value)
+        self.pred_pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        self.pred_fc_proj = nn.Linear(128 * 16 * 16, 512)
+        self.dropout = nn.Dropout(0.2)
 
-        # Action head (Actor)
         self.action_head = nn.Linear(512, self.num_action_types)
 
-        # Value head (Critic) - Predicts probability to reach the goal (expected reward)
         self.value_head = nn.Sequential(
             nn.Linear(512, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
 
-        # Coordinate head (64x64 action space)
-        # We use the deep 128-channel spatial features directly for the coordinate heatmap
         self.coord_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
         self.coord_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
         self.coord_conv3 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
-
-        self.dropout = nn.Dropout(0.2)
 
         # Create the spatial meshgrid priors
         y_coords = torch.linspace(-1, 1, grid_size).view(-1, 1).repeat(1, grid_size)
@@ -127,10 +183,8 @@ class ActionModel(nn.Module):
         # Combine into [2, H, W]
         self.register_buffer('meshgrid', torch.stack([y_coords, x_coords], dim=0))
 
-    def forward(self, x, hidden_state=None):
-        # x is expected to be shape [batch, seq_len, channels, height, width]
-        # In Phase 1, the LSTM is gone, so seq_len is just an extra batch dimension.
-        # hidden_state is maintained in the signature for compatibility with other methods (for now).
+    def representation(self, x):
+        """Initial inference step mapping observation to hidden state."""
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
 
@@ -138,35 +192,41 @@ class ActionModel(nn.Module):
         mesh = self.meshgrid.unsqueeze(0).repeat(batch_size * seq_len, 1, 1, 1)
         x = torch.cat([x, mesh], dim=1)
 
-        # ResNet Backbone (Representation Network)
-        x = F.relu(self.bn_in(self.conv_in(x)))
-        res_features = self.res_blocks(x)
-        spatial_features = F.relu(self.conv_out(res_features))  # shape: [batch*seq, 128, 64, 64]
+        x = F.relu(self.rep_bn_in(self.rep_conv_in(x)))
+        res_features = self.rep_res_blocks(x)
+        hidden_state = F.relu(self.rep_conv_out(res_features))
+        return hidden_state, batch_size, seq_len
 
-        # Prepare 1D features for Actor and Critic
-        pooled = self.pool(spatial_features) # [batch*seq, 128, 16, 16]
+    def prediction(self, hidden_state, batch_size, seq_len):
+        """Maps hidden state to policy (action probabilities) and value."""
+        pooled = self.pred_pool(hidden_state)
         flattened = pooled.view(batch_size * seq_len, -1)
-        common_features = F.relu(self.fc_proj(flattened)) # [batch*seq, 512]
+        common_features = F.relu(self.pred_fc_proj(flattened))
         common_features = self.dropout(common_features)
 
-        # Action head (Actor)
         action_logits = self.action_head(common_features)
 
-        # Value Head (Critic)
         state_values = self.value_head(common_features)
         state_values = state_values.view(batch_size, seq_len)
 
-        # Coordinate head (Spatial Head)
-        coord_features = F.relu(self.coord_conv1(spatial_features))
+        coord_features = F.relu(self.coord_conv1(hidden_state))
         coord_features = F.relu(self.coord_conv2(coord_features))
         coord_logits = self.coord_conv3(coord_features)
         coord_logits = coord_logits.view(batch_size * seq_len, -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
-        # Reshape to [batch, seq_len, 6+4096]
         combined_logits = combined_logits.view(batch_size, seq_len, -1)
 
-        return combined_logits, state_values, None # hidden_state is always None now
+        return combined_logits, state_values
+
+    def forward(self, x, hidden_state=None):
+        """
+        Standard forward pass for Behavioral Cloning and Actor-Critic RL.
+        (MCTS will use .representation, .dynamics_network, and .prediction directly).
+        """
+        hidden_state, batch_size, seq_len = self.representation(x)
+        combined_logits, state_values = self.prediction(hidden_state, batch_size, seq_len)
+        return combined_logits, state_values, None
 
 
 # --- Action Agent (AmadeusZero) ---
