@@ -59,7 +59,23 @@ def setup_logging_for_experiment(log_file_path):
     root_logger.addHandler(file_handler)
 
 
-# --- ActionModel CNN ---
+# --- ActionModel ResNet ---
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = F.relu(out)
+        return out
 
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
@@ -69,20 +85,26 @@ class ActionModel(nn.Module):
         self.grid_size = grid_size
         self.num_action_types = 6  # ACTION1-ACTION5, plus ACTION6
 
-        # Shared convolutional backbone (Added 2 channels for X/Y meshgrid)
-        self.conv1 = nn.Conv2d(input_channels + 2, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        # ResNet Representation Network (Replaces shallow CNN + LSTM)
+        self.conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(64)
 
-        # LSTM Working Memory
-        self.proj = nn.Conv2d(256, 32, kernel_size=1)
-        self.action_pool = nn.MaxPool2d(4, 4)
-        self.lstm = nn.LSTM(input_size=32 * 16 * 16, hidden_size=512, batch_first=True)
+        self.res_blocks = nn.Sequential(
+            ResidualBlock(64),
+            ResidualBlock(64),
+            ResidualBlock(64),
+            ResidualBlock(64)
+        )
+
+        self.conv_out = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+
+        # We flatten the spatial dimensions (128 channels * 64 * 64) for the Actor/Critic heads.
+        # To keep parameter count reasonable, we use max pooling first.
+        self.pool = nn.MaxPool2d(4, 4) # output is 16x16
+        self.fc_proj = nn.Linear(128 * 16 * 16, 512)
 
         # Action head (Actor)
         self.action_head = nn.Linear(512, self.num_action_types)
-        self.lstm_to_spatial = nn.Linear(512, 32)
 
         # Value head (Critic) - Predicts probability to reach the goal (expected reward)
         self.value_head = nn.Sequential(
@@ -92,11 +114,10 @@ class ActionModel(nn.Module):
         )
 
         # Coordinate head (64x64 action space)
-        # Using a sequence of 3x3 convs to create a receptive field for the heatmap
-        self.coord_conv1 = nn.Conv2d(256 + 32, 128, kernel_size=3, padding=1)
-        self.coord_conv2 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
-        self.coord_conv3 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
-        self.coord_conv4 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        # We use the deep 128-channel spatial features directly for the coordinate heatmap
+        self.coord_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
+        self.coord_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
+        self.coord_conv3 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
 
         self.dropout = nn.Dropout(0.2)
 
@@ -108,6 +129,8 @@ class ActionModel(nn.Module):
 
     def forward(self, x, hidden_state=None):
         # x is expected to be shape [batch, seq_len, channels, height, width]
+        # In Phase 1, the LSTM is gone, so seq_len is just an extra batch dimension.
+        # hidden_state is maintained in the signature for compatibility with other methods (for now).
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
 
@@ -115,43 +138,35 @@ class ActionModel(nn.Module):
         mesh = self.meshgrid.unsqueeze(0).repeat(batch_size * seq_len, 1, 1, 1)
         x = torch.cat([x, mesh], dim=1)
 
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        conv_features = F.relu(self.conv4(x))
+        # ResNet Backbone (Representation Network)
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        res_features = self.res_blocks(x)
+        spatial_features = F.relu(self.conv_out(res_features))  # shape: [batch*seq, 128, 64, 64]
 
-        # Flatten for LSTM. We need to pool first to match input_size
-        proj_features = F.relu(self.proj(conv_features))
-        pooled_features = self.action_pool(proj_features)
-        flattened = pooled_features.view(batch_size, seq_len, -1)
+        # Prepare 1D features for Actor and Critic
+        pooled = self.pool(spatial_features) # [batch*seq, 128, 16, 16]
+        flattened = pooled.view(batch_size * seq_len, -1)
+        common_features = F.relu(self.fc_proj(flattened)) # [batch*seq, 512]
+        common_features = self.dropout(common_features)
 
-        lstm_out, hidden_state = self.lstm(flattened, hidden_state)
+        # Action head (Actor)
+        action_logits = self.action_head(common_features)
 
-        # Action head (using LSTM output)
-        action_features = self.dropout(lstm_out.contiguous().view(batch_size * seq_len, -1))
-        action_logits = self.action_head(action_features)
+        # Value Head (Critic)
+        state_values = self.value_head(common_features)
+        state_values = state_values.view(batch_size, seq_len)
 
-        # Coordinate head
-        # Project LSTM features back into spatial dimensions [batch * seq_len, 32, h, w]
-        mem_features = F.relu(self.lstm_to_spatial(lstm_out.contiguous().view(batch_size * seq_len, -1)))
-        mem_spatial = mem_features.view(batch_size * seq_len, 32, 1, 1).expand(-1, -1, h, w)
-        coord_input = torch.cat([conv_features, mem_spatial], dim=1)
-
-        coord_features = F.relu(self.coord_conv1(coord_input))
+        # Coordinate head (Spatial Head)
+        coord_features = F.relu(self.coord_conv1(spatial_features))
         coord_features = F.relu(self.coord_conv2(coord_features))
-        coord_features = F.relu(self.coord_conv3(coord_features))
-        coord_logits = self.coord_conv4(coord_features)
+        coord_logits = self.coord_conv3(coord_features)
         coord_logits = coord_logits.view(batch_size * seq_len, -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
         # Reshape to [batch, seq_len, 6+4096]
         combined_logits = combined_logits.view(batch_size, seq_len, -1)
 
-        # Value Head
-        state_values = self.value_head(lstm_out.contiguous().view(batch_size * seq_len, -1))
-        state_values = state_values.view(batch_size, seq_len)
-
-        return combined_logits, state_values, hidden_state
+        return combined_logits, state_values, None # hidden_state is always None now
 
 
 # --- Action Agent (AmadeusZero) ---
@@ -193,6 +208,8 @@ class AmadeusZero(Agent):
         self.num_colours = 16
         self.action_model = ActionModel(input_channels=self.num_colours, grid_size=self.grid_size).to(self.device)
         self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
+
+        # LSTM hidden state is removed in Phase 1 ResNet transition
         self.hidden_state = None
 
         # Experience buffer (online RL experiences)
@@ -477,7 +494,6 @@ class AmadeusZero(Agent):
                         [t['action_idx'] for t in transitions], dtype=torch.long
                     )  # [N]
 
-                    hidden = None  # carry hidden state across chunks (detached each step); reset for each game trajectory
                     starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
 
                     for start in starts:
@@ -486,7 +502,7 @@ class AmadeusZero(Agent):
                         chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
 
                         bc_optimizer.zero_grad()
-                        logits, state_values, hidden = self.action_model(chunk_states, hidden)  # [1, L, output_dim]
+                        logits, state_values, _ = self.action_model(chunk_states)  # [1, L, output_dim]
                         logits_sq = logits.squeeze(0)  # [L, 4102]
 
                         # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
@@ -509,8 +525,6 @@ class AmadeusZero(Agent):
                         bc_optimizer.step()
                         epoch_loss += loss.item()
                         total_chunks += 1
-                        # Detach hidden state — prevents gradient graph from growing unbounded
-                        hidden = tuple(h.detach() for h in hidden)
 
                 if (epoch + 1) % 1 == 0:
                     avg = epoch_loss / max(total_chunks, 1)
@@ -787,7 +801,6 @@ class AmadeusZero(Agent):
                 # Note: We purposely do NOT reset network and optimizer here anymore,
                 # allowing the agent to retain its learned weights across levels of the same game.
                 print("Keeping action model and optimizer weights for new level")
-                self.hidden_state = None
 
                 self.prev_frame = None
                 self.prev_action_idx = None
@@ -841,7 +854,7 @@ class AmadeusZero(Agent):
             with torch.no_grad():
                 # Add batch and seq_len dimensions: [1, 1, C, H, W]
                 current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
-                combined_logits, state_values, self.hidden_state = self.action_model(current_frame_seq, self.hidden_state)
+                combined_logits, state_values, _ = self.action_model(current_frame_seq)
                 # Remove batch and seq_len dims for sampling: [1, 1, output_dim] -> [output_dim]
                 combined_logits = combined_logits.squeeze(0).squeeze(0)
                 action_idx, coords, coord_idx, all_probs = self._sample_from_combined_output(
