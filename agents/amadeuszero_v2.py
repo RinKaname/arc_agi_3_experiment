@@ -67,7 +67,7 @@ class ActionModel(nn.Module):
     def __init__(self, input_channels=16, grid_size=64):
         super().__init__()
         self.grid_size = grid_size
-        self.num_action_types = 5  # ACTION1-ACTION5
+        self.num_action_types = 6  # ACTION1-ACTION5, plus ACTION6
 
         # Shared convolutional backbone (Added 2 channels for X/Y meshgrid)
         self.conv1 = nn.Conv2d(input_channels + 2, 32, kernel_size=3, padding=1)
@@ -518,9 +518,9 @@ class AmadeusZero(Agent):
         return score if score is not None else frame.levels_completed
 
     def _sample_from_combined_output(self, combined_logits, available_actions=None):
-        """Sample from combined 5 + 64x64 action space with masking for invalid actions."""
-        action_logits = combined_logits[:5]
-        coord_logits = combined_logits[5:]
+        """Sample from combined 6 + 64x64 action space with masking for invalid actions."""
+        action_logits = combined_logits[:6]
+        coord_logits = combined_logits[6:]
 
         try:
             has_actions = available_actions is not None and len(available_actions) > 0
@@ -529,57 +529,37 @@ class AmadeusZero(Agent):
 
         if has_actions:
             action_mask = torch.full_like(action_logits, float('-inf'))
-            action6_available = False
             for action in available_actions:
                 # Gateway sends raw ints [1,2,...,6], not GameAction enums
                 action_id = action.value if hasattr(action, 'value') else int(action)
-                if 1 <= action_id <= 5:
+                if 1 <= action_id <= 6:
                     action_mask[action_id - 1] = 0.0
-                elif action_id == 6:
-                    action6_available = True
             action_logits = action_logits + action_mask
-            if not action6_available:
-                coord_logits = coord_logits + torch.full_like(coord_logits, float('-inf'))
 
-        action_probs = torch.sigmoid(action_logits)
-        coord_probs_raw = torch.sigmoid(coord_logits)
-        # Using raw probabilities directly to reflect model's true confidence,
-        # avoiding artificial suppression of coordinate actions
-        coord_probs_scaled = coord_probs_raw
+        # Hierarchical sampling: First select the action type (0-5)
+        action_probs = F.softmax(action_logits, dim=0)
+        action_probs_np = action_probs.cpu().numpy()
 
-        all_probs_sampling = torch.cat([action_probs, coord_probs_scaled])
-        sum_probs = all_probs_sampling.sum()
-        if sum_probs == 0 or torch.isnan(sum_probs):
-            # Fall back to uniform distribution over available actions/coords to prevent NaNs
-            uniform_mask = torch.zeros_like(all_probs_sampling)
-            if has_actions:
-                for action in available_actions:
-                    action_id = action.value if hasattr(action, 'value') else int(action)
-                    if 1 <= action_id <= 5:
-                        uniform_mask[action_id - 1] = 1.0
-                    elif action_id == 6:
-                        uniform_mask[5:] = 1.0 / self.num_coordinates
-            else:
-                uniform_mask[:5] = 1.0
-            sum_probs = uniform_mask.sum()
-            all_probs_sampling = uniform_mask / sum_probs
+        if np.isnan(action_probs_np).any():
+            # Fallback
+            action_probs_np = np.ones_like(action_probs_np) / 6.0
+
+        action_idx = np.random.choice(6, p=action_probs_np)
+
+        # Coordinate sampling
+        coord_probs = F.softmax(coord_logits, dim=0)
+        coord_probs_np = coord_probs.cpu().numpy()
+
+        if np.isnan(coord_probs_np).any():
+            coord_probs_np = np.ones_like(coord_probs_np) / len(coord_probs_np)
+
+        if action_idx < 5:
+            return action_idx, None, None, action_probs_np
         else:
-            all_probs_sampling = all_probs_sampling / sum_probs
-        all_probs_sampling_np = all_probs_sampling.cpu().numpy()
-
-        selected_idx = np.random.choice(len(all_probs_sampling_np), p=all_probs_sampling_np)
-
-        coord_probs_viz = torch.sigmoid(coord_logits)
-        all_probs_viz = torch.cat([action_probs, coord_probs_viz])
-        all_probs_viz_np = all_probs_viz.cpu().numpy()
-
-        if selected_idx < 5:
-            return selected_idx, None, None, all_probs_viz_np
-        else:
-            coord_idx = selected_idx - 5
+            coord_idx = np.random.choice(len(coord_probs_np), p=coord_probs_np)
             y_idx = coord_idx // self.grid_size
             x_idx = coord_idx % self.grid_size
-            return 5, (y_idx, x_idx), coord_idx, all_probs_viz_np
+            return 5, (y_idx, x_idx), coord_idx, coord_probs_np
 
     def _frame_to_tensor(self, frame_data):
         """Convert frame data to tensor format for the model."""
@@ -634,21 +614,41 @@ class AmadeusZero(Agent):
         # combined_logits shape: [batch=1, seq_len, output_dim]
         combined_logits, _ = self.action_model(states)
 
-        # --- RL loss: BCE with reward signal on the selected action logit ---
-        selected_logits = combined_logits.gather(2, action_indices.unsqueeze(2)).squeeze(2)
-        main_loss = F.binary_cross_entropy_with_logits(selected_logits, rewards.clamp(0.0, 1.0))
+        # --- RL loss: Policy Gradient with categorical cross entropy ---
+
+        # Determine the target labels based on action_indices
+        action_type_targets = torch.where(action_indices < 5, action_indices, torch.tensor(5, device=self.device))
+
+        # Cross entropy loss for the action type
+        loss_action = F.cross_entropy(
+            combined_logits[:, :, :6].reshape(-1, 6),
+            action_type_targets.reshape(-1),
+            reduction='none'
+        ).reshape(1, -1)
+
+        # Mask and calculate coordinate loss where ACTION6 was chosen
+        coord_mask = (action_indices >= 5)
+        loss_coord = torch.zeros_like(loss_action)
+        if coord_mask.any():
+            coord_targets = action_indices[coord_mask] - 5
+            loss_coord[coord_mask] = F.cross_entropy(
+                combined_logits[:, :, 6:][coord_mask],
+                coord_targets,
+                reduction='none'
+            )
+
+        # Apply rewards to the losses
+        step_losses = (loss_action + loss_coord) * rewards
+        main_loss = step_losses.mean()
 
         # --- Entropy regularisation (encourages exploration) ---
-        all_probs = torch.sigmoid(combined_logits)
+        action_probs = F.softmax(combined_logits[:, :, :6], dim=-1)
+        action_entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(-1).mean()
 
-        # Add small epsilon to prevent log(0)
-        eps = 1e-8
-        entropy_vals = -(all_probs * torch.log(all_probs + eps) + (1.0 - all_probs) * torch.log(1.0 - all_probs + eps))
+        coord_probs = F.softmax(combined_logits[:, :, 6:], dim=-1)
+        coord_entropy = -(coord_probs * torch.log(coord_probs + 1e-8)).sum(-1).mean()
 
-        action_entropy = entropy_vals[:, :, :5].mean()
-        coord_entropy = entropy_vals[:, :, 5:].mean()
-
-        total_loss = main_loss - 0.0001 * action_entropy - 0.00001 * coord_entropy
+        total_loss = main_loss - 0.001 * action_entropy - 0.0001 * coord_entropy
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
         self.optimizer.step()
