@@ -447,7 +447,7 @@ class AmadeusZero(Agent):
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
         bc_epochs = 30
-        chunk_size = 16  # BPTT window — keeps VRAM flat regardless of demo length
+        chunk_size = 64  # Increased BPTT window to prevent reactive "spamming" policies. Still safe for VRAM.
         print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
         try:
             # Fresh optimizer — no stale momentum/variance from the RL checkpoint
@@ -581,8 +581,12 @@ class AmadeusZero(Agent):
                     action_mask[action_id - 1] = 0.0
             action_logits = action_logits + action_mask
 
+        # Temperature scaling forces exploration even if the model is highly confident.
+        # This prevents the "Spamming UP" 0.999 probability policy collapse.
+        temperature = 1.5
+
         # Hierarchical sampling: First select the action type (0-5)
-        action_probs = F.softmax(action_logits, dim=0)
+        action_probs = F.softmax(action_logits / temperature, dim=0)
         action_probs_np = action_probs.cpu().numpy()
 
         if np.isnan(action_probs_np).any():
@@ -592,7 +596,7 @@ class AmadeusZero(Agent):
         action_idx = np.random.choice(6, p=action_probs_np)
 
         # Coordinate sampling
-        coord_probs = F.softmax(coord_logits, dim=0)
+        coord_probs = F.softmax(coord_logits / temperature, dim=0)
         coord_probs_np = coord_probs.cpu().numpy()
 
         if np.isnan(coord_probs_np).any():
@@ -702,7 +706,8 @@ class AmadeusZero(Agent):
         # MSE between predicted expected return (state_values) and actual empirical return (rewards)
         value_loss = F.mse_loss(state_values, rewards)
 
-        total_loss = main_loss + 0.5 * value_loss - 0.001 * action_entropy - 0.0001 * coord_entropy
+        # Significantly increased entropy penalty (0.05 vs 0.001) to penalize 99% confident spamming.
+        total_loss = main_loss + 0.5 * value_loss - 0.05 * action_entropy - 0.005 * coord_entropy
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
         self.optimizer.step()
