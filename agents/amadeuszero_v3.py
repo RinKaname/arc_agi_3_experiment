@@ -247,13 +247,13 @@ class MCTSNode:
 
 
 class MCTS:
-    def __init__(self, action_model: nn.Module, num_simulations: int = 50, c_puct: float = 1.5, discount: float = 0.99):
+    def __init__(self, action_model: nn.Module, num_simulations: int = 100, c_puct: float = 1.5, discount: float = 0.99):
         self.action_model = action_model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.discount = discount
 
-    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None) -> tuple[int, np.ndarray]:
+    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None, tested_actions: set[int] = None) -> tuple[int, np.ndarray]:
         """
         Run MCTS from root observation.
         Returns:
@@ -277,13 +277,30 @@ class MCTS:
         coord_logits = combined_logits[6:]
 
         # Filter available actions for root node
+        action_mask = torch.zeros_like(action_logits)
+
+        # 1. Official game valid actions mask
         if available_actions is not None and len(available_actions) > 0:
             action_mask = torch.full_like(action_logits, float('-inf'))
             for action in available_actions:
                 action_id = action.value if hasattr(action, 'value') else int(action)
                 if 1 <= action_id <= 6:
                     action_mask[action_id - 1] = 0.0
-            action_logits = action_logits + action_mask
+
+        # 2. Graph Explorer mask: penalize/block actions already tested in this exact state hash
+        if tested_actions is not None and len(tested_actions) > 0:
+            # We use a huge negative penalty rather than -inf so the agent *can* retry
+            # if absolutely all actions are exhausted, but highly prefers untested frontiers.
+            for a_idx in tested_actions:
+                if a_idx < 5:
+                    action_mask[a_idx] = float('-1e9')
+                else:
+                    # It's a coordinate action
+                    if action_mask[5] != float('-inf'):
+                        coord_idx = a_idx - 5
+                        coord_logits[coord_idx] = float('-1e9')
+
+        action_logits = action_logits + action_mask
 
         # Apply temperature scaling to root policy to keep decision-making smooth
         temperature = 1.5
@@ -296,7 +313,7 @@ class MCTS:
         root_policy[5:] = action_probs[5] * coord_probs
 
         # Determine candidate actions to expand at root (before adding noise so we don't pick random junk)
-        candidate_actions = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=8)
+        candidate_actions = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=32)
 
         # Add Dirichlet noise to the root policy to ensure exploration (MuZero/AlphaZero standard)
         dirichlet_alpha = 0.3
@@ -367,7 +384,7 @@ class MCTS:
                 leaf_policy[5:] = action_probs[5] * coord_probs
 
                 # Sample candidate actions for this leaf node
-                leaf_candidates = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=8)
+                leaf_candidates = self._sample_candidate_actions(action_probs, coord_probs, num_candidates=32)
 
                 # Using Dynamics network to predict next hidden state and reward for each candidate action
                 with torch.no_grad():
@@ -516,6 +533,8 @@ class AmadeusZero(Agent):
         # Experience buffer (online RL experiences)
         self.experience_buffer = deque(maxlen=200000)
         self.visitation_counts = {}
+        # Graph Explorer: map state_hash to a set of tested action indices
+        self.tested_actions = {}
         self.batch_size = 64
         self.train_frequency = 5
         # Pinned human demonstration buffer — never evicted, always sampled
@@ -535,8 +554,11 @@ class AmadeusZero(Agent):
         # Checkpoint configuration
         self.checkpoint_dir = "checkpoints"
         self.checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.game_id}_model_v2.pth")
-        self._load_checkpoint()
-        self._pretrain_on_human_demonstration()
+        loaded = self._load_checkpoint()
+        if loaded:
+            self._pretrain_on_human_demonstration(bc_epochs=0)
+        else:
+            self._pretrain_on_human_demonstration(bc_epochs=35)
         atexit.register(self._save_checkpoint)
 
     def _save_checkpoint(self) -> None:
@@ -573,13 +595,17 @@ class AmadeusZero(Agent):
         finally:
             self._save_lock.release()
 
-    def _load_checkpoint(self) -> None:
-        """Load model and optimizer state dicts from checkpoint file if it exists."""
+    def _load_checkpoint(self) -> bool:
+        """Load model and optimizer state dicts from checkpoint file if it exists.
+
+        Returns:
+            bool: True if checkpoint was loaded successfully, False otherwise.
+        """
         if not os.path.exists(self.checkpoint_path):
             self.logger.info(f"No checkpoint found at {self.checkpoint_path}, starting fresh.")
             print(f"No checkpoint found at {self.checkpoint_path}, starting fresh.")
             self.action_counter = 0
-            return
+            return False
         try:
             checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
             # Handle architecture mismatch gracefully
@@ -593,16 +619,18 @@ class AmadeusZero(Agent):
                 )
                 print(f"Checkpoint architecture mismatch — starting fresh. Old checkpoint kept as .incompatible")
                 self.action_counter = 0
-                return
+                return False
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.current_score = checkpoint.get('current_score', -1)
             self.action_counter = checkpoint.get('action_counter', 0)
             self.logger.info(f"Loaded checkpoint from {self.checkpoint_path} (action_counter={self.action_counter})")
             print(f"Loaded checkpoint from {self.checkpoint_path} (action_counter={self.action_counter})")
+            return True
         except Exception as e:
             self.logger.error(f"Failed to load checkpoint: {e}")
             print(f"Failed to load checkpoint: {e}")
             self.action_counter = 0
+            return False
 
     def _action_input_to_index(self, action_id: Any, data: dict[str, Any]) -> Optional[int]:
         if action_id is None:
@@ -632,7 +660,7 @@ class AmadeusZero(Agent):
             coord_idx = y * self.grid_size + x
             return 5 + coord_idx
 
-    def _pretrain_on_human_demonstration(self) -> None:
+    def _pretrain_on_human_demonstration(self, bc_epochs: int = 35) -> None:
         """Find and pre-train the model on matching human/player demonstration recordings.
 
         Uses two complementary techniques:
@@ -768,97 +796,97 @@ class AmadeusZero(Agent):
         # ------------------------------------------------------------------
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
         # ------------------------------------------------------------------
-        bc_epochs = 35 # Increased to 35 to prevent policy collapse (per memory)
-        chunk_size = 32  # Reduced to 32 to prevent overfitting and VRAM OOM on 6GB GPU
-        print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
-        try:
-            # Fresh optimizer — no stale momentum/variance from the RL checkpoint
-            bc_optimizer = optim.Adam(self.action_model.parameters(), lr=0.0003, weight_decay=1e-4) # Aligned with user's snippet
+        if bc_epochs > 0:
+            chunk_size = 32  # Reduced to 32 to prevent overfitting and VRAM OOM on 6GB GPU
+            print(f"Behavioral Cloning: {bc_epochs} epochs, chunk={chunk_size} (truncated BPTT)...")
+            try:
+                # Fresh optimizer — no stale momentum/variance from the RL checkpoint
+                bc_optimizer = optim.Adam(self.action_model.parameters(), lr=0.0003, weight_decay=1e-4) # Aligned with user's snippet
 
-            best_loss = float('inf')
-            patience = 5
-            epochs_without_improvement = 0
+                best_loss = float('inf')
+                patience = 5
+                epochs_without_improvement = 0
 
-            # Pre-build CPU tensors once before training to avoid 10x overhead of converting/stacking on every epoch
-            prebuilt_trajectories = []
-            for transitions in trajectories:
-                if len(transitions) < 1:
-                    continue
-                states_tensor = torch.stack([
-                    torch.from_numpy(t['state']).float() for t in transitions
-                ])  # [N, C, H, W]
-                labels_tensor = torch.tensor(
-                    [t['action_idx'] for t in transitions], dtype=torch.long
-                )  # [N]
-                prebuilt_trajectories.append((states_tensor, labels_tensor))
-
-            for epoch in range(bc_epochs):
-                epoch_loss = 0.0
-                total_chunks = 0
-
-                # Shuffle trajectories to avoid ordering bias across epochs
-                random.shuffle(prebuilt_trajectories)
-
-                for all_states_cpu, all_labels_cpu in prebuilt_trajectories:
-                    n = all_states_cpu.size(0)
-                    if n < 1:
+                # Pre-build CPU tensors once before training to avoid 10x overhead of converting/stacking on every epoch
+                prebuilt_trajectories = []
+                for transitions in trajectories:
+                    if len(transitions) < 1:
                         continue
+                    states_tensor = torch.stack([
+                        torch.from_numpy(t['state']).float() for t in transitions
+                    ])  # [N, C, H, W]
+                    labels_tensor = torch.tensor(
+                        [t['action_idx'] for t in transitions], dtype=torch.long
+                    )  # [N]
+                    prebuilt_trajectories.append((states_tensor, labels_tensor))
 
-                    starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
+                for epoch in range(bc_epochs):
+                    epoch_loss = 0.0
+                    total_chunks = 0
 
-                    for start in starts:
-                        end = min(start + chunk_size, n)
-                        chunk_states = all_states_cpu[start:end].to(self.device).unsqueeze(0)  # [1, L, C, H, W]
-                        chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
+                    # Shuffle trajectories to avoid ordering bias across epochs
+                    random.shuffle(prebuilt_trajectories)
 
-                        bc_optimizer.zero_grad()
-                        logits, state_values, _ = self.action_model(chunk_states)  # [1, L, output_dim]
-                        logits_sq = logits.squeeze(0)  # [L, 4102]
+                    for all_states_cpu, all_labels_cpu in prebuilt_trajectories:
+                        n = all_states_cpu.size(0)
+                        if n < 1:
+                            continue
 
-                        # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
-                        action_type_labels = torch.where(chunk_labels < 5, chunk_labels, torch.tensor(5, device=chunk_labels.device))
+                        starts = list(range(0, n, chunk_size))  # sequential order, NOT shuffled
 
-                        # 1. Action Type Loss
-                        loss_action = F.cross_entropy(logits_sq[:, :6], action_type_labels)
+                        for start in starts:
+                            end = min(start + chunk_size, n)
+                            chunk_states = all_states_cpu[start:end].to(self.device).unsqueeze(0)  # [1, L, C, H, W]
+                            chunk_labels = all_labels_cpu[start:end].to(self.device)               # [L]
 
-                        # 2. Coordinate Loss (only applied if action 5 was the true label)
-                        coord_mask = (chunk_labels >= 5)
-                        loss_coord = torch.tensor(0.0, device=logits.device)
-                        if coord_mask.any():
-                            coord_labels = chunk_labels[coord_mask] - 5
-                            coord_logits = logits_sq[coord_mask, 6:]
-                            loss_coord = F.cross_entropy(coord_logits, coord_labels)
+                            bc_optimizer.zero_grad()
+                            logits, state_values, _ = self.action_model(chunk_states)  # [1, L, output_dim]
+                            logits_sq = logits.squeeze(0)  # [L, 4102]
 
-                        loss = loss_action + loss_coord
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
-                        bc_optimizer.step()
-                        epoch_loss += loss.item()
-                        total_chunks += 1
+                            # Labels: if < 5, it's action 0-4. If >= 5, it's action 5 (coord action) and the rest is coord_idx
+                            action_type_labels = torch.where(chunk_labels < 5, chunk_labels, torch.tensor(5, device=chunk_labels.device))
 
-                if (epoch + 1) % 1 == 0:
-                    avg = epoch_loss / max(total_chunks, 1)
-                    print(f"  BC epoch {epoch + 1}/{bc_epochs}  avg_loss={avg:.4f}", flush=True)
+                            # 1. Action Type Loss
+                            loss_action = F.cross_entropy(logits_sq[:, :6], action_type_labels)
 
-                    # Early stopping logic
-                    if avg < best_loss:
-                        best_loss = avg
-                        epochs_without_improvement = 0
-                    else:
-                        epochs_without_improvement += 1
+                            # 2. Coordinate Loss (only applied if action 5 was the true label)
+                            coord_mask = (chunk_labels >= 5)
+                            loss_coord = torch.tensor(0.0, device=logits.device)
+                            if coord_mask.any():
+                                coord_labels = chunk_labels[coord_mask] - 5
+                                coord_logits = logits_sq[coord_mask, 6:]
+                                loss_coord = F.cross_entropy(coord_logits, coord_labels)
 
-                    if epochs_without_improvement >= patience:
-                        print(f"Early stopping triggered at epoch {epoch + 1}: Loss hasn't improved for {patience} epochs.")
-                        break
+                            loss = loss_action + loss_coord
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(self.action_model.parameters(), max_norm=1.0)
+                            bc_optimizer.step()
+                            epoch_loss += loss.item()
+                            total_chunks += 1
 
-            # Restore fresh RL optimizer — BC changed the weight landscape significantly
-            self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
-            print("Behavioral Cloning pre-training complete.")
-            self.logger.info("Behavioral Cloning pre-training complete.")
-        except Exception as e:
-            self.logger.error(f"Error during BC pre-training: {e}")
-            print(f"Error during BC pre-training: {e}")
-            traceback.print_exc()
+                    if (epoch + 1) % 1 == 0:
+                        avg = epoch_loss / max(total_chunks, 1)
+                        print(f"  BC epoch {epoch + 1}/{bc_epochs}  avg_loss={avg:.4f}", flush=True)
+
+                        # Early stopping logic
+                        if avg < best_loss:
+                            best_loss = avg
+                            epochs_without_improvement = 0
+                        else:
+                            epochs_without_improvement += 1
+
+                        if epochs_without_improvement >= patience:
+                            print(f"Early stopping triggered at epoch {epoch + 1}: Loss hasn't improved for {patience} epochs.")
+                            break
+
+                # Restore fresh RL optimizer — BC changed the weight landscape significantly
+                self.optimizer = optim.Adam(self.action_model.parameters(), lr=0.0001, weight_decay=1e-4) # Aligned with user snippet
+                print("Behavioral Cloning pre-training complete.")
+                self.logger.info("Behavioral Cloning pre-training complete.")
+            except Exception as e:
+                self.logger.error(f"Error during BC pre-training: {e}")
+                print(f"Error during BC pre-training: {e}")
+                traceback.print_exc()
 
         # ------------------------------------------------------------------
         # 4. Experience Injection — pin human demos into a permanent buffer
@@ -966,10 +994,12 @@ class AmadeusZero(Agent):
         Unrolls the dynamics network step-by-step to compute policy, value, reward, and consistency losses.
         """
         if full_episode:
-            seq_len = len(self.experience_buffer)
+            # Dynamically cap at MAX_ACTIONS (with a fallback of 200) to ensure full episode training
+            max_seq = getattr(self, "MAX_ACTIONS", 200)
+            seq_len = min(max_seq, len(self.experience_buffer))
             if seq_len < 2:
                 return
-            sequence = list(self.experience_buffer)
+            sequence = list(self.experience_buffer)[-seq_len:]
         else:
             seq_len = min(10, len(self.experience_buffer))
             if seq_len < 2:
@@ -1143,7 +1173,8 @@ class AmadeusZero(Agent):
                 self.experience_buffer.clear()
 
                 self.visitation_counts.clear()
-                print("Cleared experience buffer - new level reached")
+                self.tested_actions.clear() # Clear graph for new level
+                print("Cleared experience buffer & graph - new level reached")
 
                 # Note: We purposely do NOT reset network and optimizer here anymore,
                 # allowing the agent to retain its learned weights across levels of the same game.
@@ -1162,33 +1193,44 @@ class AmadeusZero(Agent):
                  self.experience_buffer.clear()
 
                  self.visitation_counts.clear()
+                 self.tested_actions.clear()
 
             if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
                 self.prev_frame = None
                 self.prev_action_idx = None
+                self.experience_buffer.clear()
+                self.visitation_counts.clear()
+                self.tested_actions.clear()
                 action = GameAction.RESET
                 action.reasoning = "Game needs reset."
                 return action
 
             # Convert current frame to tensor
             current_frame = self._frame_to_tensor(latest_frame)
+            current_grid = np.array(latest_frame.frame, dtype=np.int64)[-1]
+            current_state_hash = hashlib.md5(current_grid.tobytes()).hexdigest()
 
             # Create experience from previous action
             if self.prev_frame is not None:
                 current_frame_np = current_frame.cpu().numpy().astype(bool)
                 frame_changed = not np.array_equal(self.prev_frame, current_frame_np)
 
+                # Update Graph Explorer: record the action we took from the previous state
+                # Note: We use self.prev_state_hash which we save at the end of the step
+                if hasattr(self, 'prev_state_hash') and self.prev_state_hash is not None:
+                    if self.prev_state_hash not in self.tested_actions:
+                        self.tested_actions[self.prev_state_hash] = set()
+                    self.tested_actions[self.prev_state_hash].add(self.prev_action_idx)
+
                 # Calculate curiosity/novelty search reward bonus
-                current_grid = np.array(latest_frame.frame, dtype=np.int64)[-1]
-                grid_hash = hashlib.md5(current_grid.tobytes()).hexdigest()
-                self.visitation_counts[grid_hash] = self.visitation_counts.get(grid_hash, 0) + 1
+                self.visitation_counts[current_state_hash] = self.visitation_counts.get(current_state_hash, 0) + 1
 
                 # Reward: constant time penalty to encourage solving quickly,
                 # negative for stagnation (so BCE suppresses wasted actions).
                 # We remove the flat +0.1 for frame_changed to prevent the agent from
                 # exploiting interaction animations (like bumping a locked door).
                 step_reward = -0.1
-                reward = step_reward + (0.01 / np.sqrt(self.visitation_counts[grid_hash]))
+                reward = step_reward + (0.01 / np.sqrt(self.visitation_counts[current_state_hash]))
 
                 experience = {
                     'state': self.prev_frame,
@@ -1200,12 +1242,13 @@ class AmadeusZero(Agent):
 
             # Get action predictions using MCTS
             available_actions = getattr(latest_frame, 'available_actions', None)
+            tested_in_current_state = self.tested_actions.get(current_state_hash, set())
             
             # Run MCTS from current frame
             # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
             current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
             
-            action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions)
+            action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions, tested_in_current_state)
             self.action_model.train()
 
             if action_idx < 5:
@@ -1221,6 +1264,7 @@ class AmadeusZero(Agent):
 
             # Store current frame and action for next experience creation
             self.prev_frame = current_frame.cpu().numpy().astype(bool)
+            self.prev_state_hash = current_state_hash
             if action_idx < 5:
                 self.prev_action_idx = action_idx
             else:

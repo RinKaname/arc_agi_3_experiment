@@ -18,7 +18,7 @@ This project uses a reinforcement learning (RL) approach combined with Behaviora
 * **Hierarchical Action Head:** Predicts a categorical type (1-6). If type 6 is chosen, it subsequently samples from a spatial coordinate heatmap. This fixes the mathematical probability distortion.
 * **Loss Function:** Replaced isolated Binary Cross Entropy (BCE) with categorical Cross-Entropy. This provides a negative gradient to unselected actions, stabilizing RL drift.
 
-## 🚀 The Path Forward: Why MuZero?
+## 🚀 The Path Forward: Why MuZero and Graph Exploration?
 The user correctly identified that a pure "Reactive" CNN+LSTM cannot reason about unseen ARC puzzles. It can perfectly memorize human demonstrations (BC), but cannot perform deductive reasoning.
 
 **The MuZero Transition:**
@@ -28,6 +28,16 @@ For AmadeusZero to truly solve unseen ARC tasks, it must evolve into a MuZero-st
 2. **Dynamics Network:** Given a latent state and an action, predict the *next* latent state and the reward (i.e., simulate clicks in its head without interacting with the real environment).
 3. **Prediction Network:** Evaluate the value of the latent state and the prior probabilities of actions.
 4. **MCTS:** Use the above networks to plan out a sequence of clicks (imagination) before actually executing a move on the real ARC grid.
+
+### 🗺️ The "Graph Explorer" Paradigm
+Based on recent ARC-AGI-3 findings ([Graph-Based Exploration for ARC-AGI-3 Interactive Reasoning Tasks - arXiv:2512.24156v1](https://arxiv.org/html/2512.24156v1)), frontier LLMs and pure Deep RL struggle massively with the 96,000 step limits and sparse rewards.
+The state-of-the-art solution involves:
+1. Treating the game as a **deterministic graph of states**.
+2. **Hashing** every visual state visited.
+3. Tracking which actions have been attempted from each state hash.
+4. **Forcing exploration of new frontiers** by actively masking/blocking MCTS or Random choices from selecting actions that have already been tested in the current state.
+
+Our roadmap includes integrating a rigorous `tested_actions` Graph Explorer layer directly into AmadeusZero's `choose_action` loop to prevent RL stagnation and infinite animation-farming loops.
 
 ## 🛑 Agent Instructions / Rules
 1. **Never alter `amadeuszero.py` structurally.** It must remain compatible with existing `_model.pth` checkpoints. All major structural enhancements belong in `v2` or subsequent versions.
