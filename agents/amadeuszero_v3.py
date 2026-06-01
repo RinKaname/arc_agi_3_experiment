@@ -1183,9 +1183,11 @@ class AmadeusZero(Agent):
                 grid_hash = hashlib.md5(current_grid.tobytes()).hexdigest()
                 self.visitation_counts[grid_hash] = self.visitation_counts.get(grid_hash, 0) + 1
 
-                # Reward: positive for frame changes (so BCE reinforces good actions),
-                # negative for stagnation (so BCE suppresses wasted actions)
-                step_reward = 0.1 if frame_changed else -0.1
+                # Reward: constant time penalty to encourage solving quickly,
+                # negative for stagnation (so BCE suppresses wasted actions).
+                # We remove the flat +0.1 for frame_changed to prevent the agent from
+                # exploiting interaction animations (like bumping a locked door).
+                step_reward = -0.1
                 reward = step_reward + (0.01 / np.sqrt(self.visitation_counts[grid_hash]))
 
                 experience = {
