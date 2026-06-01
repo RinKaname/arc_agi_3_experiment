@@ -732,19 +732,23 @@ class AmadeusZero(Agent):
                     continue
 
                 # Apply discounted rewards per trajectory
-                gamma = 0.997
-                running = 1.0
+                # Using 10.0 terminal reward and 0.99 gamma to match RL win logic
+                gamma = 0.99
+                running_reward = 10.0
                 last_score = transitions[-1]['score'] if transitions else 0
 
                 for i in reversed(range(len(transitions))):
                     current_score = transitions[i]['score']
                     if current_score != last_score:
                         # New level boundary moving backwards, reset running reward
-                        running = 1.0
+                        running_reward = 10.0
                         last_score = current_score
 
-                    transitions[i]['reward'] = running
-                    running *= gamma
+                    # Store both step_reward (0.1 for moving) and the discounted terminal reward
+                    # This ensures the human buffer looks identical to a winning RL buffer
+                    transitions[i]['step_reward'] = 0.1
+                    transitions[i]['reward'] = running_reward + 0.1
+                    running_reward *= gamma
 
                 trajectories.append(transitions)
                 print(f"Parsed {len(transitions)} transitions from {human_file}.")
