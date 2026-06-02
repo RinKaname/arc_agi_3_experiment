@@ -535,6 +535,8 @@ class AmadeusZero(Agent):
         self.visitation_counts = {}
         # Graph Explorer: map state_hash to a set of tested action indices
         self.tested_actions = {}
+        # Expert Map: map state_hash to perfect human action_idx
+        self.expert_map = {}
         self.batch_size = 64
         self.train_frequency = 5
         # Pinned human demonstration buffer — never evicted, always sampled
@@ -745,6 +747,17 @@ class AmadeusZero(Agent):
                             'reward': 1.0,  # placeholder; will be set below
                             'score': data.get('score', data.get('levels_completed', 0))
                         })
+                        # Build the deterministic Expert Map
+                        # The frame is stored as the last channel, exactly how we compute current_grid
+                        if hasattr(self, 'last_seen_grid_np') and self.last_seen_grid_np is not None:
+                            state_hash = hashlib.md5(self.last_seen_grid_np.tobytes()).hexdigest()
+                            # Ensure we don't insert None into the map from RESETS or trajectory boundaries
+                            if prev_action_idx is not None:
+                                self.expert_map[state_hash] = prev_action_idx
+
+                    # Save this grid for the NEXT iteration's map building
+                    if data.get("frame"):
+                         self.last_seen_grid_np = np.array(data.get("frame")[-1], dtype=np.int64)
 
                     action_input = data.get("action_input")
                     if action_input:
@@ -792,6 +805,12 @@ class AmadeusZero(Agent):
             return
 
         print(f"Total transitions parsed: {total_transitions} across {len(trajectories)} trajectories.")
+        print(f"Expert Map populated with {len(self.expert_map)} unique state hashes.")
+        self.logger.info(f"Expert Map populated with {len(self.expert_map)} unique state hashes.")
+
+        # Cleanup temp variable
+        if hasattr(self, 'last_seen_grid_np'):
+            del self.last_seen_grid_np
 
         # ------------------------------------------------------------------
         # 3. Behavioral Cloning — truncated BPTT with sequential chunk ordering.
@@ -1240,27 +1259,52 @@ class AmadeusZero(Agent):
                 }
                 self.experience_buffer.append(experience)
 
-            # Get action predictions using MCTS
-            available_actions = getattr(latest_frame, 'available_actions', None)
-            tested_in_current_state = self.tested_actions.get(current_state_hash, set())
-            
-            # Run MCTS from current frame
-            # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
-            current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
-            
-            action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions, tested_in_current_state)
-            self.action_model.train()
+            # Check the deterministic Expert Map first!
+            # If the human has solved this exact state, bypass the neural network guessing entirely.
+            if current_state_hash in self.expert_map and self.expert_map[current_state_hash] is not None:
+                action_idx = self.expert_map[current_state_hash]
 
-            if action_idx < 5:
-                selected_action = self.action_list[action_idx]
-                selected_action.reasoning = f"{selected_action.name} (MCTS visits: {visit_probs[action_idx]:.3f})"
+                if action_idx < 5:
+                    selected_action = self.action_list[action_idx]
+                    selected_action.reasoning = f"{selected_action.name} (Deterministic Expert Map Match)"
+                else:
+                    selected_action = GameAction.ACTION6
+                    coord_idx = action_idx - 5
+                    y = coord_idx // self.grid_size
+                    x = coord_idx % self.grid_size
+                    selected_action.set_data({"x": int(x), "y": int(y)})
+                    selected_action.reasoning = f"ACTION6 at ({x}, {y}) (Deterministic Expert Map Match)"
+
+                # Print debug info to see Expert Map triggering
+                self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}")
+                print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}", flush=True)
+
             else:
-                selected_action = GameAction.ACTION6
-                coord_idx = action_idx - 5
-                y = coord_idx // self.grid_size
-                x = coord_idx % self.grid_size
-                selected_action.set_data({"x": int(x), "y": int(y)})
-                selected_action.reasoning = f"ACTION6 at ({x}, {y}) (MCTS visits: {visit_probs[action_idx]:.3f})"
+                # Get action predictions using MCTS
+                available_actions = getattr(latest_frame, 'available_actions', None)
+                tested_in_current_state = self.tested_actions.get(current_state_hash, set())
+
+                # Run MCTS from current frame
+                # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
+                current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
+
+                action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions, tested_in_current_state)
+                self.action_model.train()
+
+                if action_idx < 5:
+                    selected_action = self.action_list[action_idx]
+                    selected_action.reasoning = f"{selected_action.name} (MCTS visits: {visit_probs[action_idx]:.3f})"
+                else:
+                    selected_action = GameAction.ACTION6
+                    coord_idx = action_idx - 5
+                    y = coord_idx // self.grid_size
+                    x = coord_idx % self.grid_size
+                    selected_action.set_data({"x": int(x), "y": int(y)})
+                    selected_action.reasoning = f"ACTION6 at ({x}, {y}) (MCTS visits: {visit_probs[action_idx]:.3f})"
+
+                # Print debug info to see MCTS visit distributions
+                self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}")
+                print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}", flush=True)
 
             # Store current frame and action for next experience creation
             self.prev_frame = current_frame.cpu().numpy().astype(bool)
@@ -1269,10 +1313,6 @@ class AmadeusZero(Agent):
                 self.prev_action_idx = action_idx
             else:
                 self.prev_action_idx = 5 + coord_idx
-
-            # Print debug info to see MCTS visit distributions
-            self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}")
-            print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}", flush=True)
 
             # Train model periodically
             if self.action_counter % self.train_frequency == 0:
