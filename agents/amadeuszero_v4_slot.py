@@ -316,12 +316,12 @@ class MCTS:
             # if absolutely all actions are exhausted, but highly prefers untested frontiers.
             for a_idx in tested_actions:
                 if a_idx < 5:
-                    action_mask[a_idx] = float('-1e9')
+                    action_mask[a_idx] = float('-5.0')
                 else:
                     # It's a coordinate action
                     if action_mask[5] != float('-inf'):
                         coord_idx = a_idx - 5
-                        coord_logits[coord_idx] = float('-1e9')
+                        coord_logits[coord_idx] = float('-5.0')
 
         action_logits = action_logits + action_mask
 
