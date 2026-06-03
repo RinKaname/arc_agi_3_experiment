@@ -79,66 +79,62 @@ class ResidualBlock(nn.Module):
         out = F.relu(out)
         return out
 
-class DynamicsNetwork(nn.Module):
-    """The Imagination Engine: Predicts the next hidden state and immediate reward given a state and action."""
-    def __init__(self, hidden_channels=128, num_action_planes=7):
+class ObjectDynamicsNetwork(nn.Module):
+    """
+    Object-Centric Imagination Engine:
+    Predicts the next set of slots (objects) and immediate reward using a Transformer Encoder.
+    """
+    def __init__(self, num_slots=10, slot_dim=64, action_dim=64):
         super().__init__()
-        # 128 (hidden state) + 7 (action planes) = 135
-        self.conv_in = nn.Conv2d(hidden_channels + num_action_planes, hidden_channels, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(hidden_channels)
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
 
-        self.res_blocks = nn.Sequential(
-            ResidualBlock(hidden_channels),
-            ResidualBlock(hidden_channels),
-            ResidualBlock(hidden_channels)
-        )
+        # Action embedding: 6 categorical actions + 4096 coordinate actions = 4102 possible actions
+        self.action_embedding = nn.Embedding(4102, action_dim)
 
-        # Reward head
-        self.pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        # We append the action embedding to each slot, so the Transformer dim is slot_dim + action_dim
+        self.d_model = slot_dim + action_dim
+
+        # A lightweight transformer to model interactions between the objects
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, dim_feedforward=256, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # Output projection back to slot dimensions
+        self.slot_proj = nn.Linear(self.d_model, slot_dim)
+
+        # Reward head (aggregates the features of all objects to predict a single reward)
         self.reward_head = nn.Sequential(
-            nn.Linear(hidden_channels * 16 * 16, 256),
+            nn.Linear(self.d_model * num_slots, 128),
             nn.ReLU(),
-            nn.Linear(256, 1) # Predicts scalar reward
+            nn.Linear(128, 1)
         )
 
-    def forward(self, hidden_state, action_planes):
-        # Concatenate spatial hidden state and action planes
-        x = torch.cat([hidden_state, action_planes], dim=1)
+    def forward(self, slots, action_idx):
+        """
+        slots: [Batch, num_slots, slot_dim]
+        action_idx: [Batch]
+        """
+        batch_size = slots.size(0)
 
-        # Process through ResNet to get next hidden state
-        x = F.relu(self.bn_in(self.conv_in(x)))
-        next_hidden_state = self.res_blocks(x)
+        # Embed action: [Batch, action_dim]
+        a_emb = self.action_embedding(action_idx)
+        # Expand action embedding to append to every slot: [Batch, num_slots, action_dim]
+        a_emb_expanded = a_emb.unsqueeze(1).expand(-1, self.num_slots, -1)
 
-        # Predict expected immediate reward
-        pooled = self.pool(next_hidden_state)
-        flattened = pooled.view(pooled.size(0), -1)
-        reward = self.reward_head(flattened).squeeze(-1)
+        # Concatenate slots and action: [Batch, num_slots, d_model]
+        x = torch.cat([slots, a_emb_expanded], dim=-1)
 
-        return next_hidden_state, reward
+        # Transformer models object-to-object interactions given the action
+        transformed = self.transformer(x)
 
-def encode_action_to_spatial_planes(action_idx, grid_size=64, device='cpu'):
-    """
-    Converts a flat action index (0 to 5 for buttons, 5 + coord for clicks)
-    into a 7-channel spatial representation [batch, 7, H, W] for the Dynamics network.
-    """
-    batch_size = action_idx.shape[0]
-    # Initialize blank canvas: 7 channels of 64x64
-    planes = torch.zeros(batch_size, 7, grid_size, grid_size, device=device)
+        # Project back to pure slot dimensions
+        next_slots = self.slot_proj(transformed)
 
-    for i in range(batch_size):
-        a = action_idx[i].item()
-        if a < 5:
-            # Action 1-5 (Global actions like MOVE UP). Fill the whole grid for that channel.
-            planes[i, a, :, :] = 1.0
-        else:
-            # Action 6 (Coordinate click).
-            coord = a - 5
-            y = coord // grid_size
-            x = coord % grid_size
-            # Only put a '1' exactly at the clicked coordinate on the 7th plane (index 6)
-            planes[i, 6, y, x] = 1.0
+        # Predict reward from the transformed interacting objects
+        flat_objects = transformed.reshape(batch_size, -1)
+        reward = self.reward_head(flat_objects).squeeze(-1)
 
-    return planes
+        return next_slots, reward
 
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
@@ -151,7 +147,7 @@ class ActionModel(nn.Module):
         self.slot_dim = 64
         self.num_slots = 10
 
-        # 1. Representation Network (CNN Backbone -> Slot Attention -> Spatial Broadcast)
+        # 1. Representation Network (CNN Backbone -> Slot Attention)
         # We extract features using a CNN
         self.rep_conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
         self.rep_bn_in = nn.BatchNorm2d(64)
@@ -166,15 +162,11 @@ class ActionModel(nn.Module):
         # We group pixels into abstract object slots
         self.slot_attention = SlotAttention(num_slots=self.num_slots, dim=self.slot_dim, hidden_dim=128)
 
-        # We broadcast the slots back into a 2D spatial representation for the Dynamics engine
-        self.spatial_decoder = SpatialBroadcastDecoder(slot_dim=self.slot_dim, grid_size=self.grid_size, out_channels=128)
+        # 2. Dynamics Network (Object Slots + Action -> Next Object Slots + Reward)
+        self.dynamics_network = ObjectDynamicsNetwork(num_slots=self.num_slots, slot_dim=self.slot_dim, action_dim=64)
 
-        # 2. Dynamics Network (Spatial Hidden State + Action -> Next Spatial Hidden State + Reward)
-        self.dynamics_network = DynamicsNetwork(hidden_channels=128, num_action_planes=7)
-
-        # 3. Prediction Network (Hidden State -> Policy + Value)
-        self.pred_pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
-        self.pred_fc_proj = nn.Linear(128 * 16 * 16, 512)
+        # 3. Prediction Network (Object Slots -> Policy + Value)
+        self.pred_fc_proj = nn.Linear(self.num_slots * self.slot_dim, 512)
         self.dropout = nn.Dropout(0.2)
 
         self.action_head = nn.Linear(512, self.num_action_types)
@@ -185,9 +177,9 @@ class ActionModel(nn.Module):
             nn.Linear(128, 1)
         )
 
-        self.coord_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
-        self.coord_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
-        self.coord_conv3 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        # We broadcast the slots back into a 2D spatial representation ONLY for picking spatial coordinates
+        self.spatial_decoder = SpatialBroadcastDecoder(slot_dim=self.slot_dim, grid_size=self.grid_size, out_channels=32)
+        self.coord_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
 
         # Create the spatial meshgrid priors
         y_coords = torch.linspace(-1, 1, grid_size).view(-1, 1).repeat(1, grid_size)
@@ -196,7 +188,7 @@ class ActionModel(nn.Module):
         self.register_buffer('meshgrid', torch.stack([y_coords, x_coords], dim=0))
 
     def representation(self, x):
-        """Initial inference step mapping observation to unified object-centric spatial hidden state."""
+        """Initial inference step mapping observation to object-centric hidden state (slots)."""
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
 
@@ -213,18 +205,14 @@ class ActionModel(nn.Module):
         cnn_flat = cnn_features.view(batch_size * seq_len, self.slot_dim, -1).permute(0, 2, 1) # [B*S, H*W, slot_dim]
         slots = self.slot_attention(cnn_flat) # [B*S, num_slots, slot_dim]
 
-        # 3. Spatial Broadcast Decoder
-        # To maintain compatibility with MuZero Dynamics and Coordinate Action picking,
-        # we broadcast the abstract objects back onto the 2D grid
-        hidden_state = self.spatial_decoder(slots) # [B*S, 128, H, W]
+        # The hidden state is now purely abstract objects, no spatial grid!
+        return slots, batch_size, seq_len
 
-        return hidden_state, batch_size, seq_len
-
-    def prediction(self, hidden_state, batch_size, seq_len):
-        """Maps hidden state to policy (action probabilities) and value."""
-        pooled = self.pred_pool(hidden_state)
-        flattened = pooled.view(batch_size * seq_len, -1)
-        common_features = F.relu(self.pred_fc_proj(flattened))
+    def prediction(self, slots, batch_size, seq_len):
+        """Maps abstract object slots to policy (action probabilities) and value."""
+        # 1. Predict global policy and value from abstract slots
+        flat_slots = slots.view(batch_size * seq_len, -1)
+        common_features = F.relu(self.pred_fc_proj(flat_slots))
         common_features = self.dropout(common_features)
 
         action_logits = self.action_head(common_features)
@@ -232,9 +220,9 @@ class ActionModel(nn.Module):
         state_values = self.value_head(common_features)
         state_values = state_values.view(batch_size, seq_len)
 
-        coord_features = F.relu(self.coord_conv1(hidden_state))
-        coord_features = F.relu(self.coord_conv2(coord_features))
-        coord_logits = self.coord_conv3(coord_features)
+        # 2. Predict coordinate actions by broadcasting abstract slots back to a 2D spatial heatmap
+        spatial_features = self.spatial_decoder(slots) # [B*S, 32, H, W]
+        coord_logits = self.coord_conv(spatial_features) # [B*S, 1, H, W]
         coord_logits = coord_logits.view(batch_size * seq_len, -1)
 
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
@@ -258,7 +246,7 @@ class MCTSNode:
         self.value_sum = 0.0
         self.prior = prior
         self.children: dict[int, MCTSNode] = {}
-        self.hidden_state = None  # Tensor of shape [1, 128, H, W]
+        self.hidden_state = None  # Tensor of shape [1, num_slots, slot_dim]
         self.reward = 0.0         # Predicted immediate reward to reach this node
 
     @property
@@ -360,11 +348,10 @@ class MCTS:
             num_cand = len(candidate_actions)
             if num_cand > 0:
                 cand_tensor = torch.tensor(candidate_actions, dtype=torch.long, device=device)
-                action_planes = encode_action_to_spatial_planes(cand_tensor, grid_size=grid_size, device=device)
 
                 # Expand root hidden state
-                expanded_hidden = root.hidden_state.repeat(num_cand, 1, 1, 1)
-                next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, action_planes)
+                expanded_hidden = root.hidden_state.expand(num_cand, -1, -1)
+                next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, cand_tensor)
 
                 for idx, a in enumerate(candidate_actions):
                     child = MCTSNode(prior=root_policy[a])
@@ -413,11 +400,10 @@ class MCTS:
                     num_cand = len(leaf_candidates)
                     if num_cand > 0:
                         cand_tensor = torch.tensor(leaf_candidates, dtype=torch.long, device=device)
-                        action_planes = encode_action_to_spatial_planes(cand_tensor, grid_size=grid_size, device=device)
 
                         # Expand leaf hidden state to match batch size
-                        expanded_hidden = node.hidden_state.repeat(num_cand, 1, 1, 1)
-                        next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, action_planes)
+                        expanded_hidden = node.hidden_state.expand(num_cand, -1, -1)
+                        next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, cand_tensor)
 
                         for idx, a in enumerate(leaf_candidates):
                             child = MCTSNode(prior=leaf_policy[a])
@@ -1134,13 +1120,8 @@ class AmadeusZero(Agent):
                     with torch.no_grad():
                         target_hidden, _, _ = self.action_model.representation(states[:, t+1:t+2])
 
-                    # Convert action taken to spatial planes
-                    action_planes = encode_action_to_spatial_planes(
-                        action_indices[:, t], grid_size=self.action_model.grid_size, device=self.device
-                    )
-
                     # Dynamics step: predict next hidden state and immediate reward
-                    next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_planes)
+                    next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_indices[:, t])
 
                     # Consistency Loss (match predicted hidden state with target representation)
                     consistency_loss = F.mse_loss(next_hidden, target_hidden.detach())
