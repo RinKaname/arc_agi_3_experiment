@@ -1,5 +1,5 @@
 # =====================================================================
-# AmadeusZero – CNN-based action learning agent
+# AmadeusZero V4 – CNN + Slot Attention (Object-Centric) Action Learning Agent
 # Source:
 # Authors: Chakra (Lead), Gerry Weber (Adviser) — CUDA MUSUME
 # GANBATTE RTX3060-CHAN!!! 就算 Kernel Panic，我的心对你也是 Thread-safe 的！
@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from agents.agent import Agent
+from agents.slot_attention import SlotAttention, SpatialBroadcastDecoder
 
 from arcengine import FrameData, GameAction, GameState
 
@@ -78,66 +79,62 @@ class ResidualBlock(nn.Module):
         out = F.relu(out)
         return out
 
-class DynamicsNetwork(nn.Module):
-    """The Imagination Engine: Predicts the next hidden state and immediate reward given a state and action."""
-    def __init__(self, hidden_channels=128, num_action_planes=7):
+class ObjectDynamicsNetwork(nn.Module):
+    """
+    Object-Centric Imagination Engine:
+    Predicts the next set of slots (objects) and immediate reward using a Transformer Encoder.
+    """
+    def __init__(self, num_slots=10, slot_dim=64, action_dim=64):
         super().__init__()
-        # 128 (hidden state) + 7 (action planes) = 135
-        self.conv_in = nn.Conv2d(hidden_channels + num_action_planes, hidden_channels, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(hidden_channels)
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
 
-        self.res_blocks = nn.Sequential(
-            ResidualBlock(hidden_channels),
-            ResidualBlock(hidden_channels),
-            ResidualBlock(hidden_channels)
-        )
+        # V5 Roadmap: 6 categorical actions + 10 slot actions = 16 possible actions
+        self.action_embedding = nn.Embedding(16, action_dim)
 
-        # Reward head
-        self.pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
+        # We append the action embedding to each slot, so the Transformer dim is slot_dim + action_dim
+        self.d_model = slot_dim + action_dim
+
+        # A lightweight transformer to model interactions between the objects
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, dim_feedforward=256, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # Output projection back to slot dimensions
+        self.slot_proj = nn.Linear(self.d_model, slot_dim)
+
+        # Reward head (aggregates the features of all objects to predict a single reward)
         self.reward_head = nn.Sequential(
-            nn.Linear(hidden_channels * 16 * 16, 256),
+            nn.Linear(self.d_model * num_slots, 128),
             nn.ReLU(),
-            nn.Linear(256, 1) # Predicts scalar reward
+            nn.Linear(128, 1)
         )
 
-    def forward(self, hidden_state, action_planes):
-        # Concatenate spatial hidden state and action planes
-        x = torch.cat([hidden_state, action_planes], dim=1)
+    def forward(self, slots, action_idx):
+        """
+        slots: [Batch, num_slots, slot_dim]
+        action_idx: [Batch]
+        """
+        batch_size = slots.size(0)
 
-        # Process through ResNet to get next hidden state
-        x = F.relu(self.bn_in(self.conv_in(x)))
-        next_hidden_state = self.res_blocks(x)
+        # Embed action: [Batch, action_dim]
+        a_emb = self.action_embedding(action_idx)
+        # Expand action embedding to append to every slot: [Batch, num_slots, action_dim]
+        a_emb_expanded = a_emb.unsqueeze(1).expand(-1, self.num_slots, -1)
 
-        # Predict expected immediate reward
-        pooled = self.pool(next_hidden_state)
-        flattened = pooled.view(pooled.size(0), -1)
-        reward = self.reward_head(flattened).squeeze(-1)
+        # Concatenate slots and action: [Batch, num_slots, d_model]
+        x = torch.cat([slots, a_emb_expanded], dim=-1)
 
-        return next_hidden_state, reward
+        # Transformer models object-to-object interactions given the action
+        transformed = self.transformer(x)
 
-def encode_action_to_spatial_planes(action_idx, grid_size=64, device='cpu'):
-    """
-    Converts a flat action index (0 to 5 for buttons, 5 + coord for clicks)
-    into a 7-channel spatial representation [batch, 7, H, W] for the Dynamics network.
-    """
-    batch_size = action_idx.shape[0]
-    # Initialize blank canvas: 7 channels of 64x64
-    planes = torch.zeros(batch_size, 7, grid_size, grid_size, device=device)
+        # Project back to pure slot dimensions
+        next_slots = self.slot_proj(transformed)
 
-    for i in range(batch_size):
-        a = action_idx[i].item()
-        if a < 5:
-            # Action 1-5 (Global actions like MOVE UP). Fill the whole grid for that channel.
-            planes[i, a, :, :] = 1.0
-        else:
-            # Action 6 (Coordinate click).
-            coord = a - 5
-            y = coord // grid_size
-            x = coord % grid_size
-            # Only put a '1' exactly at the clicked coordinate on the 7th plane (index 6)
-            planes[i, 6, y, x] = 1.0
+        # Predict reward from the transformed interacting objects
+        flat_objects = transformed.reshape(batch_size, -1)
+        reward = self.reward_head(flat_objects).squeeze(-1)
 
-    return planes
+        return next_slots, reward
 
 class ActionModel(nn.Module):
     """CNN that predicts which actions will result in new frames with shared conv backbone."""
@@ -147,7 +144,11 @@ class ActionModel(nn.Module):
         self.grid_size = grid_size
         self.num_action_types = 6  # ACTION1-ACTION5, plus ACTION6
 
-        # 1. Representation Network (Initial Observation -> Hidden State)
+        self.slot_dim = 64
+        self.num_slots = 10
+
+        # 1. Representation Network (CNN Backbone -> Slot Attention)
+        # We extract features using a CNN
         self.rep_conv_in = nn.Conv2d(input_channels + 2, 64, kernel_size=3, padding=1)
         self.rep_bn_in = nn.BatchNorm2d(64)
         self.rep_res_blocks = nn.Sequential(
@@ -156,14 +157,16 @@ class ActionModel(nn.Module):
             ResidualBlock(64),
             ResidualBlock(64)
         )
-        self.rep_conv_out = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.rep_conv_out = nn.Conv2d(64, self.slot_dim, kernel_size=3, padding=1)
 
-        # 2. Dynamics Network (Hidden State + Action -> Next Hidden State + Reward)
-        self.dynamics_network = DynamicsNetwork(hidden_channels=128, num_action_planes=7)
+        # We group pixels into abstract object slots
+        self.slot_attention = SlotAttention(num_slots=self.num_slots, dim=self.slot_dim, hidden_dim=128)
 
-        # 3. Prediction Network (Hidden State -> Policy + Value)
-        self.pred_pool = nn.MaxPool2d(4, 4) # 64x64 -> 16x16
-        self.pred_fc_proj = nn.Linear(128 * 16 * 16, 512)
+        # 2. Dynamics Network (Object Slots + Action -> Next Object Slots + Reward)
+        self.dynamics_network = ObjectDynamicsNetwork(num_slots=self.num_slots, slot_dim=self.slot_dim, action_dim=64)
+
+        # 3. Prediction Network (Object Slots -> Policy + Value)
+        self.pred_fc_proj = nn.Linear(self.num_slots * self.slot_dim, 512)
         self.dropout = nn.Dropout(0.2)
 
         self.action_head = nn.Linear(512, self.num_action_types)
@@ -174,9 +177,11 @@ class ActionModel(nn.Module):
             nn.Linear(128, 1)
         )
 
-        self.coord_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
-        self.coord_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
-        self.coord_conv3 = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        # V5 Roadmap: Slot-Centric GRU for temporal memory
+        self.slot_gru = nn.GRUCell(self.slot_dim, self.slot_dim)
+
+        # V5 Roadmap: Plan over slots instead of raw 4096 coordinates
+        self.coord_head = nn.Linear(512, self.num_slots)
 
         # Create the spatial meshgrid priors
         y_coords = torch.linspace(-1, 1, grid_size).view(-1, 1).repeat(1, grid_size)
@@ -184,8 +189,8 @@ class ActionModel(nn.Module):
         # Combine into [2, H, W]
         self.register_buffer('meshgrid', torch.stack([y_coords, x_coords], dim=0))
 
-    def representation(self, x):
-        """Initial inference step mapping observation to hidden state."""
+    def representation(self, x, prev_slots=None):
+        """Initial inference step mapping observation to object-centric hidden state (slots)."""
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
 
@@ -193,16 +198,30 @@ class ActionModel(nn.Module):
         mesh = self.meshgrid.unsqueeze(0).repeat(batch_size * seq_len, 1, 1, 1)
         x = torch.cat([x, mesh], dim=1)
 
+        # 1. CNN Feature Extraction
         x = F.relu(self.rep_bn_in(self.rep_conv_in(x)))
         res_features = self.rep_res_blocks(x)
-        hidden_state = F.relu(self.rep_conv_out(res_features))
-        return hidden_state, batch_size, seq_len
+        cnn_features = F.relu(self.rep_conv_out(res_features)) # [B*S, slot_dim, H, W]
 
-    def prediction(self, hidden_state, batch_size, seq_len):
-        """Maps hidden state to policy (action probabilities) and value."""
-        pooled = self.pred_pool(hidden_state)
-        flattened = pooled.view(batch_size * seq_len, -1)
-        common_features = F.relu(self.pred_fc_proj(flattened))
+        # 2. Slot Attention (Flatten spatial dims)
+        cnn_flat = cnn_features.view(batch_size * seq_len, self.slot_dim, -1).permute(0, 2, 1) # [B*S, H*W, slot_dim]
+        slots = self.slot_attention(cnn_flat) # [B*S, num_slots, slot_dim]
+
+        if prev_slots is not None:
+            # Update slot hidden states over sequential time steps
+            flat_slots = slots.view(-1, self.slot_dim)
+            flat_prev = prev_slots.view(-1, self.slot_dim)
+            if flat_slots.shape[0] == flat_prev.shape[0]:
+                slots = self.slot_gru(flat_slots, flat_prev).view(batch_size * seq_len, self.num_slots, self.slot_dim)
+
+        # The hidden state is now purely abstract objects, no spatial grid!
+        return slots, batch_size, seq_len
+
+    def prediction(self, slots, batch_size, seq_len):
+        """Maps abstract object slots to policy (action probabilities) and value."""
+        # 1. Predict global policy and value from abstract slots
+        flat_slots = slots.view(batch_size * seq_len, -1)
+        common_features = F.relu(self.pred_fc_proj(flat_slots))
         common_features = self.dropout(common_features)
 
         action_logits = self.action_head(common_features)
@@ -210,23 +229,23 @@ class ActionModel(nn.Module):
         state_values = self.value_head(common_features)
         state_values = state_values.view(batch_size, seq_len)
 
-        coord_features = F.relu(self.coord_conv1(hidden_state))
-        coord_features = F.relu(self.coord_conv2(coord_features))
-        coord_logits = self.coord_conv3(coord_features)
-        coord_logits = coord_logits.view(batch_size * seq_len, -1)
+        # 2. Predict spatial coordinates natively from abstract slots
+        # In V5, we output num_slots logits instead of 4096 logits
+        coord_logits = self.coord_head(common_features)
 
+        # 3. Concatenate all possible actions into a single 1D space per step
+        # [B*S, 6] concat [B*S, 10] -> [B*S, 16]
         combined_logits = torch.cat([action_logits, coord_logits], dim=1)
         combined_logits = combined_logits.view(batch_size, seq_len, -1)
 
         return combined_logits, state_values
 
-    def forward(self, x, hidden_state=None):
+    def forward(self, x, hidden_state=None, prev_slots=None):
         """
         Standard forward pass for Behavioral Cloning and Actor-Critic RL.
-        (MCTS will use .representation, .dynamics_network, and .prediction directly).
         """
-        hidden_state, batch_size, seq_len = self.representation(x)
-        combined_logits, state_values = self.prediction(hidden_state, batch_size, seq_len)
+        hidden_state_out, batch_size, seq_len = self.representation(x, prev_slots)
+        combined_logits, state_values = self.prediction(hidden_state_out, batch_size, seq_len)
         return combined_logits, state_values, None
 
 
@@ -236,7 +255,7 @@ class MCTSNode:
         self.value_sum = 0.0
         self.prior = prior
         self.children: dict[int, MCTSNode] = {}
-        self.hidden_state = None  # Tensor of shape [1, 128, H, W]
+        self.hidden_state = None  # Tensor of shape [1, num_slots, slot_dim]
         self.reward = 0.0         # Predicted immediate reward to reach this node
 
     @property
@@ -253,12 +272,12 @@ class MCTS:
         self.c_puct = c_puct
         self.discount = discount
 
-    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None, tested_actions: set[int] = None) -> tuple[int, np.ndarray]:
+    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None, tested_actions: set[int] = None, salient_coords: list[tuple[int, int]] = None, action_effect_tracker: dict = None, prev_slots: torch.Tensor = None) -> tuple[int, np.ndarray]:
         """
         Run MCTS from root observation.
         Returns:
             - Selected action index
-            - Visit counts/probabilities distribution over the full 4101-action space
+            - Visit counts/probabilities distribution over the full 16-action space
         """
         self.action_model.eval()
         device = next(self.action_model.parameters()).device
@@ -267,14 +286,57 @@ class MCTS:
         # 1. Representation step for root
         with torch.no_grad():
             # root_observation shape: [1, 1, C, H, W]
-            hidden_state, batch_size, seq_len = self.action_model.representation(root_observation)
+            hidden_state, batch_size, seq_len = self.action_model.representation(root_observation, prev_slots)
             # hidden_state shape: [1, 128, H, W]
             combined_logits, state_values = self.action_model.prediction(hidden_state, batch_size, seq_len)
-            combined_logits = combined_logits.squeeze(0).squeeze(0)  # [4102]
+            combined_logits = combined_logits.squeeze(0).squeeze(0)  # [16]
 
         # 2. Get root policy distribution
         action_logits = combined_logits[:6]
         coord_logits = combined_logits[6:]
+
+        # V5 Roadmap: Prioritize slots dynamically or generally add exploration
+        # to encourage use of slots
+        coord_logits += 0.5
+
+        # V5 Roadmap: Target computed centroids from Contiguous Shape Clustering
+        if salient_coords is not None and len(salient_coords) > 0:
+            with torch.no_grad():
+                # Extract slot attention maps once for the root node to boost slots representing salient objects
+                _, _, _, h, w = root_observation.size()
+                x_t = root_observation.view(1, -1, h, w)
+                mesh = self.action_model.meshgrid.unsqueeze(0)
+                x_cat = torch.cat([x_t, mesh], dim=1)
+                features = torch.nn.functional.relu(self.action_model.rep_conv_out(self.action_model.rep_res_blocks(torch.nn.functional.relu(self.action_model.rep_bn_in(self.action_model.rep_conv_in(x_cat))))))
+                cnn_flat = features.view(1, self.action_model.slot_dim, -1).permute(0, 2, 1)
+
+                inputs = self.action_model.slot_attention.norm_input(cnn_flat)
+                k = self.action_model.slot_attention.to_k(inputs)
+                slots_orig = prev_slots if prev_slots is not None else self.action_model.slot_attention.slots_mu + torch.exp(self.action_model.slot_attention.slots_logsigma) * torch.randn(1, self.action_model.num_slots, self.action_model.slot_dim, device=device)
+                q = self.action_model.slot_attention.to_q(slots_orig)
+                dots = torch.einsum('bid,bjd->bij', q, k) * self.action_model.slot_attention.scale
+                attn = dots.softmax(dim=1)
+
+                for slot_idx in range(self.action_model.num_slots):
+                    slot_attn = attn[0, slot_idx].view(self.action_model.grid_size, self.action_model.grid_size)
+                    y_indices, x_indices = torch.meshgrid(torch.arange(self.action_model.grid_size, device=device), torch.arange(self.action_model.grid_size, device=device), indexing='ij')
+                    y_com = (y_indices.float() * slot_attn).sum() / (slot_attn.sum() + 1e-8)
+                    x_com = (x_indices.float() * slot_attn).sum() / (slot_attn.sum() + 1e-8)
+                    y_slot = y_com.item()
+                    x_slot = x_com.item()
+
+                    # If this slot centroid is close to any salient object centroid, boost it
+                    for (y_sal, x_sal) in salient_coords:
+                        if abs(y_slot - y_sal) < 3.0 and abs(x_slot - x_sal) < 3.0:
+                            coord_logits[slot_idx] += 2.0
+                            break
+
+        # HF Roadmap: Softly penalize global actions known to have low effect
+        if action_effect_tracker is not None:
+            for i in range(5):
+                # If an action has a <10% chance of causing a frame change based on our tracker
+                if action_effect_tracker.get(i, 0.5) < 0.1:
+                    action_logits[i] -= 5.0
 
         # Filter available actions for root node
         action_mask = torch.zeros_like(action_logits)
@@ -307,8 +369,8 @@ class MCTS:
         action_probs = F.softmax(action_logits / temperature, dim=0).cpu().numpy()
         coord_probs = F.softmax(coord_logits / temperature, dim=0).cpu().numpy()
 
-        # Build full 4101-size policy prior for root (ACTION1-ACTION5 at 0-4, ACTION6 coordinates at 5-4100)
-        root_policy = np.zeros(5 + 4096)
+        # Build full 15-size policy prior for root
+        root_policy = np.zeros(5 + self.action_model.num_slots)
         root_policy[:5] = action_probs[:5]
         root_policy[5:] = action_probs[5] * coord_probs
 
@@ -338,11 +400,10 @@ class MCTS:
             num_cand = len(candidate_actions)
             if num_cand > 0:
                 cand_tensor = torch.tensor(candidate_actions, dtype=torch.long, device=device)
-                action_planes = encode_action_to_spatial_planes(cand_tensor, grid_size=grid_size, device=device)
 
                 # Expand root hidden state
-                expanded_hidden = root.hidden_state.repeat(num_cand, 1, 1, 1)
-                next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, action_planes)
+                expanded_hidden = root.hidden_state.expand(num_cand, -1, -1)
+                next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, cand_tensor)
 
                 for idx, a in enumerate(candidate_actions):
                     child = MCTSNode(prior=root_policy[a])
@@ -379,7 +440,7 @@ class MCTS:
                 action_probs = F.softmax(action_logits / temperature, dim=0).cpu().numpy()
                 coord_probs = F.softmax(coord_logits / temperature, dim=0).cpu().numpy()
 
-                leaf_policy = np.zeros(5 + 4096)
+                leaf_policy = np.zeros(5 + self.action_model.num_slots)
                 leaf_policy[:5] = action_probs[:5]
                 leaf_policy[5:] = action_probs[5] * coord_probs
 
@@ -391,11 +452,10 @@ class MCTS:
                     num_cand = len(leaf_candidates)
                     if num_cand > 0:
                         cand_tensor = torch.tensor(leaf_candidates, dtype=torch.long, device=device)
-                        action_planes = encode_action_to_spatial_planes(cand_tensor, grid_size=grid_size, device=device)
 
                         # Expand leaf hidden state to match batch size
-                        expanded_hidden = node.hidden_state.repeat(num_cand, 1, 1, 1)
-                        next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, action_planes)
+                        expanded_hidden = node.hidden_state.expand(num_cand, -1, -1)
+                        next_hidden, pred_rewards = self.action_model.dynamics_network(expanded_hidden, cand_tensor)
 
                         for idx, a in enumerate(leaf_candidates):
                             child = MCTSNode(prior=leaf_policy[a])
@@ -407,14 +467,14 @@ class MCTS:
             self._backpropagate(search_path, actions_path, leaf_value)
 
         # 4. Choose action based on root visit counts
-        visit_counts = np.zeros(5 + 4096)
+        visit_counts = np.zeros(5 + self.action_model.num_slots)
         for a, child in root.children.items():
             visit_counts[a] = child.visit_count
 
         sum_visits = visit_counts.sum()
         if sum_visits == 0:
             selected_action = np.random.choice(candidate_actions)
-            visit_probs = np.zeros(5 + 4096)
+            visit_probs = np.zeros(5 + self.action_model.num_slots)
             visit_probs[candidate_actions] = 1.0 / len(candidate_actions)
         else:
             visit_probs = visit_counts / sum_visits
@@ -535,16 +595,24 @@ class AmadeusZero(Agent):
         self.visitation_counts = {}
         # Graph Explorer: map state_hash to a set of tested action indices
         self.tested_actions = {}
-        # Expert Map: map state_hash to perfect human action_idx
-        self.expert_map = {}
         self.batch_size = 64
         self.train_frequency = 5
         # Pinned human demonstration buffer — never evicted, always sampled
         self.human_demo_buffer: list[dict] = []
 
+        # HF Roadmap Integrations
+        self.mental_map = np.zeros((self.grid_size, self.grid_size), dtype=np.int64)
+        self.salient_coords = []  # List of (y, x) coordinates for rare colored objects
+        self.action_effect_tracker = {i: 0.5 for i in range(5 + 10)}
+        self.exploration_phase = True
+        self.scan_actions_taken = 0
+        self.max_scan_actions = 20
+        self.scan_queue = [] # Queue of actions to test during systematic scan
+
         # Track previous state/action
         self.prev_frame = None
         self.prev_action_idx = None
+        self.prev_slots = None
 
         # Action mapping
         self.action_list = [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3,
@@ -555,7 +623,7 @@ class AmadeusZero(Agent):
 
         # Checkpoint configuration
         self.checkpoint_dir = "checkpoints"
-        self.checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.game_id}_model_v2.pth")
+        self.checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.game_id}_model_v4.pth")
         loaded = self._load_checkpoint()
         if loaded:
             self._pretrain_on_human_demonstration(bc_epochs=0)
@@ -657,10 +725,9 @@ class AmadeusZero(Agent):
             return action_val - 1 # ACTION1-ACTION5 maps to index 0-4
         else:
             # ACTION6
-            y = data.get("y", 0)
-            x = data.get("x", 0)
-            coord_idx = y * self.grid_size + x
-            return 5 + coord_idx
+            # In V5, we don't map coordinates to slots for BC directly
+            # Return 5 to represent a generic slot click since we ignore coord_loss during pretraining
+            return 5
 
     def _pretrain_on_human_demonstration(self, bc_epochs: int = 35) -> None:
         """Find and pre-train the model on matching human/player demonstration recordings.
@@ -775,10 +842,6 @@ class AmadeusZero(Agent):
                             'score': next_score
                         })
 
-                        # Build the deterministic Expert Map
-                        state_hash = hashlib.md5(grid_np.tobytes()).hexdigest()
-                        self.expert_map[state_hash] = action_idx
-
                 if not transitions:
                     continue
 
@@ -815,8 +878,6 @@ class AmadeusZero(Agent):
             return
 
         print(f"Total transitions parsed: {total_transitions} across {len(trajectories)} trajectories.")
-        print(f"Expert Map populated with {len(self.expert_map)} unique state hashes.")
-        self.logger.info(f"Expert Map populated with {len(self.expert_map)} unique state hashes.")
 
         # Cleanup temp variable
         if hasattr(self, 'last_seen_grid_np'):
@@ -953,6 +1014,33 @@ class AmadeusZero(Agent):
             import json
             self.recorder.record(json.loads(frame.model_dump_json()))
 
+    def _infer_salient_objects(self, grid_np: np.ndarray) -> list[tuple[int, int]]:
+        """HF Roadmap: Identify rare colored objects to target during exploration.
+           V5 Roadmap: Uses contiguous shape clustering (Connected Components) to target actual objects."""
+        from scipy.ndimage import label
+
+        salient_coords = []
+        unique, counts = np.unique(grid_np, return_counts=True)
+        total_pixels = grid_np.size
+        # Find rare colors (e.g., less than 5% of the board)
+        for color, count in zip(unique, counts):
+            if color == 0: continue # Skip background mask
+            if count / total_pixels < 0.05:
+                # Connected component labeling (4-way adjacency)
+                structure = [[0, 1, 0],
+                             [1, 1, 1],
+                             [0, 1, 0]]
+                labeled_array, num_features = label(grid_np == color, structure=structure)
+
+                # Compute centroid for each independent contiguous shape
+                for feature_idx in range(1, num_features + 1):
+                    y_coords, x_coords = np.where(labeled_array == feature_idx)
+                    if len(y_coords) > 0:
+                        centroid_y = int(np.mean(y_coords))
+                        centroid_x = int(np.mean(x_coords))
+                        salient_coords.append((centroid_y, centroid_x))
+        return salient_coords
+
     def _get_score(self, frame):
         """Get score from frame, compatible with both patched and standard FrameData."""
         score = getattr(frame, 'score', None)
@@ -1008,8 +1096,13 @@ class AmadeusZero(Agent):
 
     def _frame_to_tensor(self, frame_data):
         """Convert frame data to tensor format for the model."""
-        frame = np.array(frame_data.frame, dtype=np.int64)
-        frame = frame[-1]
+        # V5 Roadmap: Use mental_map if available
+        if hasattr(self, 'mental_map'):
+            frame = self.mental_map.copy()
+        else:
+            frame = np.array(frame_data.frame, dtype=np.int64)
+            frame = frame[-1]
+
         assert frame.shape == (self.grid_size, self.grid_size), \
             f"Expected frame shape ({self.grid_size}, {self.grid_size}), got {frame.shape}"
         tensor = torch.zeros(self.num_colours, self.grid_size, self.grid_size, dtype=torch.float32)
@@ -1062,7 +1155,9 @@ class AmadeusZero(Agent):
 
         # Recurrent unrolling trajectory for dynamics and prediction training
         total_loss = 0.0
-        hidden_state, batch_size, _ = self.action_model.representation(states[:, 0:1])
+        # Initialize an empty hidden_state for the start of chunk
+        prev_slots_train = torch.zeros((1, self.action_model.num_slots, self.action_model.slot_dim), device=self.device)
+        hidden_state, batch_size, _ = self.action_model.representation(states[:, 0:1], prev_slots_train)
 
         L = states.size(1)
         # MuZero standard unroll length to prevent compounding prediction errors and VRAM OOM
@@ -1118,15 +1213,10 @@ class AmadeusZero(Agent):
                 if t < end_t - 1:
                     # Target hidden state from representation of the actual next frame
                     with torch.no_grad():
-                        target_hidden, _, _ = self.action_model.representation(states[:, t+1:t+2])
-
-                    # Convert action taken to spatial planes
-                    action_planes = encode_action_to_spatial_planes(
-                        action_indices[:, t], grid_size=self.action_model.grid_size, device=self.device
-                    )
+                        target_hidden, _, _ = self.action_model.representation(states[:, t+1:t+2], hidden_state.detach())
 
                     # Dynamics step: predict next hidden state and immediate reward
-                    next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_planes)
+                    next_hidden, pred_reward = self.action_model.dynamics_network(hidden_state, action_indices[:, t])
 
                     # Consistency Loss (match predicted hidden state with target representation)
                     consistency_loss = F.mse_loss(next_hidden, target_hidden.detach())
@@ -1171,6 +1261,7 @@ class AmadeusZero(Agent):
         try:
             # DEBUG: Log frame info on first call
             if self.action_counter == 0:
+                self.prev_slots = torch.zeros((1, self.action_model.num_slots, self.action_model.slot_dim), device=self.device)
                 print(f"[DEBUG] latest_frame type: {type(latest_frame)}")
                 print(f"[DEBUG] latest_frame.state: {latest_frame.state}")
                 print(f"[DEBUG] latest_frame.levels_completed: {latest_frame.levels_completed}")
@@ -1179,6 +1270,11 @@ class AmadeusZero(Agent):
                 if hasattr(latest_frame, 'frame') and latest_frame.frame:
                     frame_arr = np.array(latest_frame.frame)
                     print(f"[DEBUG] frame shape: {frame_arr.shape}")
+
+            # Extract the raw 2D color grid and update mental map
+            raw_frame_2d = np.array(latest_frame.frame)[-1]
+            # Write newly revealed pixels (assuming 0 is dark background mask)
+            self.mental_map[raw_frame_2d != 0] = raw_frame_2d[raw_frame_2d != 0]
 
             # Check if score/level has changed (triggers model reset for new level)
             current_level = self._get_score(latest_frame)
@@ -1205,6 +1301,11 @@ class AmadeusZero(Agent):
                 self.tested_actions.clear() # Clear graph for new level
                 print("Cleared experience buffer & graph - new level reached")
 
+                # Reset systematic exploration for new level
+                self.exploration_phase = True
+                self.scan_actions_taken = 0
+                self.scan_queue = list(range(5)) # Queue up global actions 0-4
+
                 # Note: We purposely do NOT reset network and optimizer here anymore,
                 # allowing the agent to retain its learned weights across levels of the same game.
                 print("Keeping action model and optimizer weights for new level")
@@ -1230,6 +1331,9 @@ class AmadeusZero(Agent):
                 self.experience_buffer.clear()
                 self.visitation_counts.clear()
                 self.tested_actions.clear()
+                self.exploration_phase = True
+                self.scan_actions_taken = 0
+                self.scan_queue = list(range(5))
                 action = GameAction.RESET
                 action.reasoning = "Game needs reset."
                 return action
@@ -1239,10 +1343,19 @@ class AmadeusZero(Agent):
             current_grid = np.array(latest_frame.frame, dtype=np.int64)[-1]
             current_state_hash = hashlib.md5(current_grid.tobytes()).hexdigest()
 
+            # HF Roadmap: Update salient objects if missing or starting new scan
+            if not self.salient_coords or self.scan_actions_taken == 0:
+                self.salient_coords = self._infer_salient_objects(current_grid)
+
             # Create experience from previous action
             if self.prev_frame is not None:
                 current_frame_np = current_frame.cpu().numpy().astype(bool)
                 frame_changed = not np.array_equal(self.prev_frame, current_frame_np)
+
+                # HF Roadmap: Update Action Effect Tracker (EMA of frame change success)
+                alpha = 0.1
+                current_val = self.action_effect_tracker.get(self.prev_action_idx, 0.5)
+                self.action_effect_tracker[self.prev_action_idx] = (1 - alpha) * current_val + alpha * float(frame_changed)
 
                 # Update Graph Explorer: record the action we took from the previous state
                 # Note: We use self.prev_state_hash which we save at the end of the step
@@ -1269,60 +1382,134 @@ class AmadeusZero(Agent):
                 }
                 self.experience_buffer.append(experience)
 
-            # Check the deterministic Expert Map first!
-            # If the human has solved this exact state, bypass the neural network guessing entirely.
-            if current_state_hash in self.expert_map and self.expert_map[current_state_hash] is not None:
-                action_idx = self.expert_map[current_state_hash]
+            tested_in_current_state = self.tested_actions.get(current_state_hash, set())
 
-                if action_idx < 5:
-                    selected_action = self.action_list[action_idx]
-                    selected_action.reasoning = f"{selected_action.name} (Deterministic Expert Map Match)"
-                else:
-                    selected_action = GameAction.ACTION6
-                    coord_idx = action_idx - 5
-                    y = coord_idx // self.grid_size
-                    x = coord_idx % self.grid_size
-                    selected_action.set_data({"x": int(x), "y": int(y)})
-                    selected_action.reasoning = f"ACTION6 at ({x}, {y}) (Deterministic Expert Map Match)"
+            # HF Roadmap: Phase 1 Systematic Exploration (Scanner Phase)
+            # Systematically test actions before falling back to MCTS guessing
+            if self.exploration_phase:
+                # If we need more scan actions, we populate the queue
+                if not self.scan_queue and self.scan_actions_taken < self.max_scan_actions:
+                    # Only populate if it's empty and we haven't hit the limit
+                    if self.scan_actions_taken == 0:
+                        # Systematically test standard actions first
+                        for i in range(5):
+                            self.scan_queue.append(i)
 
-                # Print debug info to see Expert Map triggering
-                self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}")
-                print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}", flush=True)
+                        # Systematically test all object slots instead of salient coords
+                        for i in range(self.action_model.num_slots):
+                            self.scan_queue.append(5 + i)
 
-            else:
-                # Get action predictions using MCTS
-                available_actions = getattr(latest_frame, 'available_actions', None)
-                tested_in_current_state = self.tested_actions.get(current_state_hash, set())
-
-                # Run MCTS from current frame
                 # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
                 current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
 
-                action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions, tested_in_current_state)
-                self.action_model.train()
+                while self.scan_queue:
+                    action_idx = self.scan_queue.pop(0)
 
-                if action_idx < 5:
-                    selected_action = self.action_list[action_idx]
-                    selected_action.reasoning = f"{selected_action.name} (MCTS visits: {visit_probs[action_idx]:.3f})"
-                else:
-                    selected_action = GameAction.ACTION6
-                    coord_idx = action_idx - 5
-                    y = coord_idx // self.grid_size
-                    x = coord_idx % self.grid_size
-                    selected_action.set_data({"x": int(x), "y": int(y)})
-                    selected_action.reasoning = f"ACTION6 at ({x}, {y}) (MCTS visits: {visit_probs[action_idx]:.3f})"
+                    # Ensure it's not blocked by tested_actions just in case
+                    if action_idx not in tested_in_current_state:
+                        self.scan_actions_taken += 1
+                        if action_idx < 5:
+                            selected_action = self.action_list[action_idx]
+                            selected_action.reasoning = f"{selected_action.name} (Scanner Phase)"
+                        else:
+                            selected_action = GameAction.ACTION6
+                            coord_idx = action_idx - 5
+                            y = coord_idx // self.grid_size
+                            x = coord_idx % self.grid_size
+                            selected_action.set_data({"x": int(x), "y": int(y)})
+                            selected_action.reasoning = f"ACTION6 at ({x}, {y}) (Scanner Phase)"
 
-                # Print debug info to see MCTS visit distributions
-                self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}")
-                print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}", flush=True)
+                        name_str = getattr(selected_action, 'name', str(selected_action))
+                        self.logger.info(f"[DEBUG] Chosen action: {name_str}, reasoning: {selected_action.reasoning}")
+                        print(f"[DEBUG] Chosen action: {name_str}, reasoning: {selected_action.reasoning}", flush=True)
+
+                        # Store and return
+                        self.prev_frame = current_frame.cpu().numpy().astype(bool)
+                        self.prev_state_hash = current_state_hash
+                        self.prev_action_idx = action_idx
+
+                        # V5 Roadmap: Update temporal memory and MUST detach
+                        with torch.no_grad():
+                            self.prev_slots, _, _ = self.action_model.representation(current_frame_seq, self.prev_slots)
+                            self.prev_slots = self.prev_slots.detach()
+
+                        return selected_action
+
+                # Scan queue empty and exhausted, switch to MCTS Phase 2/3
+                self.exploration_phase = False
+                print("[DEBUG] Systematic Exploration Phase Complete. Switching to MCTS Planning.", flush=True)
+
+            # Get action predictions using MCTS
+            available_actions = getattr(latest_frame, 'available_actions', None)
+
+            # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
+            current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
+
+            # Run MCTS from current frame
+
+            action_idx, visit_probs = self.mcts.run(
+                current_frame_seq,
+                available_actions,
+                tested_in_current_state,
+                salient_coords=self.salient_coords,
+                action_effect_tracker=self.action_effect_tracker,
+                prev_slots=self.prev_slots
+            )
+            self.action_model.train()
+
+            if action_idx < 5:
+                selected_action = self.action_list[action_idx]
+                name_str = getattr(selected_action, 'name', str(selected_action))
+                selected_action.reasoning = f"{name_str} (MCTS visits: {visit_probs[action_idx]:.3f})"
+            else:
+                selected_action = GameAction.ACTION6
+                slot_idx = action_idx - 5
+
+                # MCTS chose a slot, we need to map it to a physical coordinate using slot attention
+                with torch.no_grad():
+                    _, _, _, h, w = current_frame_seq.size()
+                    x_t = current_frame_seq.view(1, -1, h, w)
+                    mesh = self.action_model.meshgrid.unsqueeze(0)
+                    x_cat = torch.cat([x_t, mesh], dim=1)
+                    features = torch.nn.functional.relu(self.action_model.rep_conv_out(self.action_model.rep_res_blocks(torch.nn.functional.relu(self.action_model.rep_bn_in(self.action_model.rep_conv_in(x_cat))))))
+                    cnn_flat = features.view(1, self.action_model.slot_dim, -1).permute(0, 2, 1)
+
+                    inputs = self.action_model.slot_attention.norm_input(cnn_flat)
+                    k = self.action_model.slot_attention.to_k(inputs)
+                    slots_orig = self.prev_slots if self.prev_slots is not None else self.action_model.slot_attention.slots_mu + torch.exp(self.action_model.slot_attention.slots_logsigma) * torch.randn(1, self.action_model.num_slots, self.action_model.slot_dim, device=self.device)
+                    q = self.action_model.slot_attention.to_q(slots_orig)
+                    dots = torch.einsum('bid,bjd->bij', q, k) * (self.action_model.slot_attention.scale)
+                    attn = dots.softmax(dim=1)
+
+                    slot_attn = attn[0, slot_idx].view(self.action_model.grid_size, self.action_model.grid_size)
+
+                    y_indices, x_indices = torch.meshgrid(torch.arange(self.action_model.grid_size, device=self.device), torch.arange(self.action_model.grid_size, device=self.device), indexing='ij')
+                    y_com = (y_indices.float() * slot_attn).sum() / (slot_attn.sum() + 1e-8)
+                    x_com = (x_indices.float() * slot_attn).sum() / (slot_attn.sum() + 1e-8)
+                    y = int(y_com.item())
+                    x = int(x_com.item())
+
+                selected_action.set_data({"x": x, "y": y})
+                selected_action.reasoning = f"ACTION6 from Slot {slot_idx} mapped to ({x}, {y}) (MCTS visits: {visit_probs[action_idx]:.3f})"
+
+            name_str = getattr(selected_action, 'name', str(selected_action))
+            # Print debug info to see MCTS visit distributions
+            self.logger.info(f"[DEBUG] Chosen action: {name_str}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}")
+            print(f"[DEBUG] Chosen action: {name_str}, reasoning: {selected_action.reasoning}, visit_probs (first 10): {visit_probs[:10].tolist()}", flush=True)
 
             # Store current frame and action for next experience creation
             self.prev_frame = current_frame.cpu().numpy().astype(bool)
             self.prev_state_hash = current_state_hash
+
+            # V5 Roadmap: Update temporal memory and MUST detach
+            with torch.no_grad():
+                self.prev_slots, _, _ = self.action_model.representation(current_frame_seq, self.prev_slots)
+                self.prev_slots = self.prev_slots.detach()
+
             if action_idx < 5:
                 self.prev_action_idx = action_idx
             else:
-                self.prev_action_idx = 5 + coord_idx
+                self.prev_action_idx = 5 + slot_idx
 
             # Train model periodically
             if self.action_counter % self.train_frequency == 0:
