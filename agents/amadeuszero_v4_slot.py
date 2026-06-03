@@ -263,7 +263,7 @@ class MCTS:
         self.c_puct = c_puct
         self.discount = discount
 
-    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None, tested_actions: set[int] = None) -> tuple[int, np.ndarray]:
+    def run(self, root_observation: torch.Tensor, available_actions: list[int] = None, tested_actions: set[int] = None, salient_coords: list[tuple[int, int]] = None, action_effect_tracker: dict = None) -> tuple[int, np.ndarray]:
         """
         Run MCTS from root observation.
         Returns:
@@ -285,6 +285,19 @@ class MCTS:
         # 2. Get root policy distribution
         action_logits = combined_logits[:6]
         coord_logits = combined_logits[6:]
+
+        # HF Roadmap: Boost prior probabilities for inferred salient objects
+        if salient_coords is not None:
+            for y, x in salient_coords:
+                coord_idx = y * grid_size + x
+                coord_logits[coord_idx] += 2.0  # Soft boost to salient objects
+
+        # HF Roadmap: Softly penalize global actions known to have low effect
+        if action_effect_tracker is not None:
+            for i in range(5):
+                # If an action has a <10% chance of causing a frame change based on our tracker
+                if action_effect_tracker.get(i, 0.5) < 0.1:
+                    action_logits[i] -= 5.0
 
         # Filter available actions for root node
         action_mask = torch.zeros_like(action_logits)
@@ -547,6 +560,14 @@ class AmadeusZero(Agent):
         self.train_frequency = 5
         # Pinned human demonstration buffer — never evicted, always sampled
         self.human_demo_buffer: list[dict] = []
+
+        # HF Roadmap Integrations
+        self.salient_coords = []  # List of (y, x) coordinates for rare colored objects
+        self.action_effect_tracker = {i: 0.5 for i in range(5 + self.grid_size * self.grid_size)}
+        self.exploration_phase = True
+        self.scan_actions_taken = 0
+        self.max_scan_actions = 20
+        self.scan_queue = [] # Queue of actions to test during systematic scan
 
         # Track previous state/action
         self.prev_frame = None
@@ -953,6 +974,24 @@ class AmadeusZero(Agent):
             import json
             self.recorder.record(json.loads(frame.model_dump_json()))
 
+    def _infer_salient_objects(self, grid_np: np.ndarray) -> list[tuple[int, int]]:
+        """HF Roadmap: Identify rare colored objects (e.g., < 5% of pixels) to target during exploration."""
+        salient_coords = []
+        unique, counts = np.unique(grid_np, return_counts=True)
+        total_pixels = grid_np.size
+        # Find rare colors (e.g., less than 5% of the board)
+        for color, count in zip(unique, counts):
+            if color == 0: continue # Skip background
+            if count / total_pixels < 0.05:
+                # Find coordinates of these rare pixels
+                y_coords, x_coords = np.where(grid_np == color)
+                # Take the centroid (center of mass) for that color
+                if len(y_coords) > 0:
+                    centroid_y = int(np.mean(y_coords))
+                    centroid_x = int(np.mean(x_coords))
+                    salient_coords.append((centroid_y, centroid_x))
+        return salient_coords
+
     def _get_score(self, frame):
         """Get score from frame, compatible with both patched and standard FrameData."""
         score = getattr(frame, 'score', None)
@@ -1200,6 +1239,11 @@ class AmadeusZero(Agent):
                 self.tested_actions.clear() # Clear graph for new level
                 print("Cleared experience buffer & graph - new level reached")
 
+                # Reset systematic exploration for new level
+                self.exploration_phase = True
+                self.scan_actions_taken = 0
+                self.scan_queue = list(range(5)) # Queue up global actions 0-4
+
                 # Note: We purposely do NOT reset network and optimizer here anymore,
                 # allowing the agent to retain its learned weights across levels of the same game.
                 print("Keeping action model and optimizer weights for new level")
@@ -1225,6 +1269,9 @@ class AmadeusZero(Agent):
                 self.experience_buffer.clear()
                 self.visitation_counts.clear()
                 self.tested_actions.clear()
+                self.exploration_phase = True
+                self.scan_actions_taken = 0
+                self.scan_queue = list(range(5))
                 action = GameAction.RESET
                 action.reasoning = "Game needs reset."
                 return action
@@ -1234,10 +1281,19 @@ class AmadeusZero(Agent):
             current_grid = np.array(latest_frame.frame, dtype=np.int64)[-1]
             current_state_hash = hashlib.md5(current_grid.tobytes()).hexdigest()
 
+            # HF Roadmap: Update salient objects if missing or starting new scan
+            if not self.salient_coords or self.scan_actions_taken == 0:
+                self.salient_coords = self._infer_salient_objects(current_grid)
+
             # Create experience from previous action
             if self.prev_frame is not None:
                 current_frame_np = current_frame.cpu().numpy().astype(bool)
                 frame_changed = not np.array_equal(self.prev_frame, current_frame_np)
+
+                # HF Roadmap: Update Action Effect Tracker (EMA of frame change success)
+                alpha = 0.1
+                current_val = self.action_effect_tracker.get(self.prev_action_idx, 0.5)
+                self.action_effect_tracker[self.prev_action_idx] = (1 - alpha) * current_val + alpha * float(frame_changed)
 
                 # Update Graph Explorer: record the action we took from the previous state
                 # Note: We use self.prev_state_hash which we save at the end of the step
@@ -1264,15 +1320,62 @@ class AmadeusZero(Agent):
                 }
                 self.experience_buffer.append(experience)
 
+            tested_in_current_state = self.tested_actions.get(current_state_hash, set())
+
+            # HF Roadmap: Phase 1 Systematic Exploration (Scanner Phase)
+            # Systematically test actions before falling back to MCTS guessing
+            if self.exploration_phase:
+                # If we need more scan actions, we populate the queue
+                if not self.scan_queue and self.scan_actions_taken < self.max_scan_actions:
+                    # After basic keys, scan salient objects
+                    for (y, x) in self.salient_coords:
+                        coord_idx = y * self.grid_size + x
+                        self.scan_queue.append(5 + coord_idx)
+
+                while self.scan_queue:
+                    action_idx = self.scan_queue.pop(0)
+
+                    # Ensure it's not blocked by tested_actions just in case
+                    if action_idx not in tested_in_current_state:
+                        self.scan_actions_taken += 1
+                        if action_idx < 5:
+                            selected_action = self.action_list[action_idx]
+                            selected_action.reasoning = f"{selected_action.name} (Scanner Phase)"
+                        else:
+                            selected_action = GameAction.ACTION6
+                            coord_idx = action_idx - 5
+                            y = coord_idx // self.grid_size
+                            x = coord_idx % self.grid_size
+                            selected_action.set_data({"x": int(x), "y": int(y)})
+                            selected_action.reasoning = f"ACTION6 at ({x}, {y}) (Scanner Phase)"
+
+                        self.logger.info(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}")
+                        print(f"[DEBUG] Chosen action: {selected_action.name}, reasoning: {selected_action.reasoning}", flush=True)
+
+                        # Store and return
+                        self.prev_frame = current_frame.cpu().numpy().astype(bool)
+                        self.prev_state_hash = current_state_hash
+                        self.prev_action_idx = action_idx
+                        return selected_action
+
+                # Scan queue empty and exhausted, switch to MCTS Phase 2/3
+                self.exploration_phase = False
+                print("[DEBUG] Systematic Exploration Phase Complete. Switching to MCTS Planning.", flush=True)
+
             # Get action predictions using MCTS
             available_actions = getattr(latest_frame, 'available_actions', None)
-            tested_in_current_state = self.tested_actions.get(current_state_hash, set())
 
             # Run MCTS from current frame
             # current_frame shape: [C, H, W] -> Add batch and seq_len: [1, 1, C, H, W]
             current_frame_seq = current_frame.unsqueeze(0).unsqueeze(0)
 
-            action_idx, visit_probs = self.mcts.run(current_frame_seq, available_actions, tested_in_current_state)
+            action_idx, visit_probs = self.mcts.run(
+                current_frame_seq,
+                available_actions,
+                tested_in_current_state,
+                salient_coords=self.salient_coords,
+                action_effect_tracker=self.action_effect_tracker
+            )
             self.action_model.train()
 
             if action_idx < 5:
