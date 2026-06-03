@@ -39,6 +39,26 @@ The state-of-the-art solution involves:
 
 Our roadmap includes integrating a rigorous `tested_actions` Graph Explorer layer directly into AmadeusZero's `choose_action` loop to prevent RL stagnation and infinite animation-farming loops.
 
+### AmadeusZero V3 (amadeuszero_v3.py & amadeuszero_legacy1.py)
+* **MuZero Integration:** Replaced the LSTM with a full `DynamicsNetwork` to allow internal simulation of next hidden states. Integrated MCTS for action planning.
+* **Graph Explorer Implemented:** Integrated state-hashing to track `tested_actions` and penalize revisiting known states to combat policy collapse.
+* **Removal of the Expert Map:** The initial V3 implementation (backed up to `amadeuszero_legacy1.py`) utilized an "Expert Map" dictionary mapping visual hashes directly to human actions, bypassing MCTS entirely. This was removed in the final `amadeuszero_v3.py` to strip away the memorization cheat and expose the true planning capability (or lack thereof) of the underlying RL agent.
+
+## 🧩 The Next Frontier: Object-Centric Representation via Slot Attention
+With the "Expert Map" crutch removed, the pure pixel-centric CNN+MCTS approach is exposed: it lacks the inherent human bias of "objectness." To achieve true reasoning, the agent must perceive the 2D grid as a collection of interacting shapes, not independent pixels.
+
+To do this while maintaining our strict offline constraint (no LLMs, no massive server compute), the roadmap is moving to **CNN + Slot Attention**:
+
+1. **The CNN Backbone (Feature Extraction):** A standard CNN processes the 64x64 input grid, but instead of outputting an action, it outputs a dense spatial "Feature Map."
+2. **Slot Attention Module (Unsupervised Object Discovery):**
+   * We initialize $K$ "slots" (e.g., 10 empty buckets/vectors).
+   * Using an iterative attention mechanism (typically 3 iterations via a GRU), the slots compete via softmax to bind to features in the CNN feature map.
+   * *Result:* The grid pixels are dynamically clustered into distinct objects (e.g., Slot 1 = Red Block, Slot 2 = Green Target, Slot 3 = Background) without any explicit bounding-box supervision.
+3. **Integration into MuZero:**
+   * The output of the Slot Attention module becomes the "Latent Hidden State."
+   * The `DynamicsNetwork` now learns how these $K$ discrete object vectors interact over time, rather than learning how 4096 pixels shift.
+   * MCTS simulates future trajectories in this abstract, object-centric space, drastically reducing the search complexity and naturally enabling relational reasoning.
+
 ## 🛑 Agent Instructions / Rules
 1. **Never alter `amadeuszero.py` structurally.** It must remain compatible with existing `_model.pth` checkpoints. All major structural enhancements belong in `v2` or subsequent versions.
 2. **Reward Math:** Ensure episodic reward discounting resets *per level* (`score` change), not continuously across entire multi-level JSONL recordings.
