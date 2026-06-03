@@ -724,8 +724,10 @@ class AmadeusZero(Agent):
                     else:
                         lines = [json.loads(l) for l in content.splitlines() if l.strip()]
 
-                prev_state_np = None
-                prev_action_idx = None
+                parsed_frames = []
+                parsed_state_tensors = []
+                parsed_actions = []
+                parsed_scores = []
 
                 for line in lines:
                     data = line.get("data", {})
@@ -735,39 +737,47 @@ class AmadeusZero(Agent):
                     if not frame_layers:
                         continue
 
+                    # 1. Parse frame
                     frame_arr = np.array(frame_layers, dtype=np.int64)[-1]  # last channel
                     tensor = torch.zeros(self.num_colours, self.grid_size, self.grid_size, dtype=torch.float32)
                     tensor.scatter_(0, torch.from_numpy(frame_arr).unsqueeze(0), 1)
                     state_np = tensor.numpy().astype(bool)
 
-                    if prev_state_np is not None and prev_action_idx is not None:
-                        transitions.append({
-                            'state': prev_state_np,
-                            'action_idx': prev_action_idx,
-                            'reward': 1.0,  # placeholder; will be set below
-                            'score': data.get('score', data.get('levels_completed', 0))
-                        })
-                        # Build the deterministic Expert Map
-                        # The frame is stored as the last channel, exactly how we compute current_grid
-                        if hasattr(self, 'last_seen_grid_np') and self.last_seen_grid_np is not None:
-                            state_hash = hashlib.md5(self.last_seen_grid_np.tobytes()).hexdigest()
-                            # Ensure we don't insert None into the map from RESETS or trajectory boundaries
-                            if prev_action_idx is not None:
-                                self.expert_map[state_hash] = prev_action_idx
-
-                    # Save this grid for the NEXT iteration's map building
-                    if data.get("frame"):
-                         self.last_seen_grid_np = np.array(data.get("frame")[-1], dtype=np.int64)
-
+                    # 2. Parse action_input
                     action_input = data.get("action_input")
+                    action_idx = None
                     if action_input:
-                        prev_action_idx = self._action_input_to_index(
+                        action_idx = self._action_input_to_index(
                             action_input.get("id"), action_input.get("data", {})
                         )
-                    else:
-                        prev_action_idx = None
 
-                    prev_state_np = state_np
+                    # 3. Parse score
+                    score = data.get('score', data.get('levels_completed', 0))
+
+                    parsed_frames.append(frame_arr)
+                    parsed_state_tensors.append(state_np)
+                    parsed_actions.append(action_idx)
+                    parsed_scores.append(score)
+
+                # Pair Line i (state S_i) with Line i+1 (action A_i taken from S_i)
+                for i in range(len(parsed_frames) - 1):
+                    state_np = parsed_state_tensors[i]
+                    grid_np = parsed_frames[i]
+                    
+                    action_idx = parsed_actions[i+1]
+                    next_score = parsed_scores[i+1]
+
+                    if action_idx is not None:
+                        transitions.append({
+                            'state': state_np,
+                            'action_idx': action_idx,
+                            'reward': 1.0,  # placeholder; will be discounted below
+                            'score': next_score
+                        })
+                        
+                        # Build the deterministic Expert Map
+                        state_hash = hashlib.md5(grid_np.tobytes()).hexdigest()
+                        self.expert_map[state_hash] = action_idx
 
                 if not transitions:
                     continue
